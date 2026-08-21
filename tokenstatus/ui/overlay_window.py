@@ -5,9 +5,11 @@ row with name, a gradient usage bar, and percentage.
 """
 from __future__ import annotations
 
+import time
+from datetime import datetime
 from typing import Callable
 
-from PyQt6.QtCore import QPoint, QPointF, QRect, Qt
+from PyQt6.QtCore import QPoint, QPointF, QRect, Qt, QTimer
 from PyQt6.QtGui import (
     QAction,
     QColor,
@@ -19,8 +21,9 @@ from PyQt6.QtGui import (
     QMouseEvent,
     QPainter,
     QPaintEvent,
+    QPolygon,
 )
-from PyQt6.QtWidgets import QMenu, QWidget
+from PyQt6.QtWidgets import QMenu, QToolTip, QWidget
 
 from ..readers import ProviderSnapshot
 
@@ -50,6 +53,8 @@ def _bar_gradient(percent: float, rect: QRect) -> QLinearGradient:
 class OverlayWindow(QWidget):
     # Edge-grab thickness in pixels for resize handles around the borderless window.
     _RESIZE_MARGIN = 6
+    _BUBBLE_INTERVAL_SECONDS = 60
+    _BUBBLE_DURATION_SECONDS = 8
 
     def __init__(
         self,
@@ -59,10 +64,12 @@ class OverlayWindow(QWidget):
         on_switch_mode: Callable[[str], None],
         on_quit: Callable[[], None],
         on_position_changed: Callable[[int, int], None],
+        on_visibility_changed: Callable[[set[str]], None] | None = None,
         on_size_changed: Callable[[int, int], None] | None = None,
         on_lock_changed: Callable[[bool], None] | None = None,
         opacity: float = 0.85,
         locked: bool = False,
+        visible_provider_ids: set[str] | None = None,
         width: int = 220,
         height: int = 96,
     ) -> None:
@@ -72,26 +79,51 @@ class OverlayWindow(QWidget):
         self._on_switch_mode = on_switch_mode
         self._on_quit = on_quit
         self._on_position_changed = on_position_changed
+        self._on_visibility_changed = on_visibility_changed
         self._on_size_changed = on_size_changed
         self._on_lock_changed = on_lock_changed
         self._locked = locked
+        self._visible_provider_ids = set(visible_provider_ids or [])
         self._snapshots: dict[str, ProviderSnapshot] = {}
         self._drag_offset: QPoint | None = None
         self._resize_edge: str | None = None
         self._resize_start_geo: QRect | None = None
         self._resize_start_global: QPoint | None = None
+        self._hovered_key: str | None = None
+        self._bubble_key: str | None = None
+        self._bubble_until = 0.0
+        self._last_auto_bubble = time.time()
+        self._has_announced_reset = False
 
         self.setWindowFlags(self._compose_flags(locked))
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setWindowOpacity(opacity)
         self.setMouseTracking(True)
+        self.setStyleSheet(
+            "QToolTip { background: #F8FAFC; color: #111827; "
+            "border: 1px solid #94A3B8; border-radius: 7px; "
+            "padding: 7px 10px; font-size: 12px; font-weight: 600; }"
+        )
         self.setMinimumSize(140, 50)
 
         self.resize(max(width, 140), max(height, 50))
+        self._bubble_timer = QTimer(self)
+        self._bubble_timer.setInterval(1000)
+        self._bubble_timer.timeout.connect(self._tick_bubble)
+        self._bubble_timer.start()
 
     # ---------- public API ----------
     def set_snapshots(self, snapshots: dict[str, ProviderSnapshot]) -> None:
         self._snapshots = snapshots
+        if self._bubble_key not in self._snapshots:
+            self._bubble_key = self._best_reset_key()
+        if not self._has_announced_reset and snapshots:
+            self._has_announced_reset = True
+            self._show_bubble(seconds=8)
+        self.update()
+
+    def set_visible_provider_ids(self, visible_provider_ids: set[str]) -> None:
+        self._visible_provider_ids = set(visible_provider_ids)
         self.update()
 
     def set_opacity(self, opacity: float) -> None:
@@ -104,10 +136,6 @@ class OverlayWindow(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
         )
-        if locked:
-            # Click-through: mouse events pass straight to the window behind it,
-            # so a locked overlay never blocks what's underneath.
-            flags |= Qt.WindowType.WindowTransparentForInput
         return flags
 
     def set_locked(self, locked: bool) -> None:
@@ -180,10 +208,7 @@ class OverlayWindow(QWidget):
         p.setPen(QColor(255, 255, 255, 45))
         p.drawRoundedRect(bg_rect, 10, 10)
 
-        rows = [
-            (k, s) for k, s in self._snapshots.items()
-            if s is not None and s.available
-        ]
+        rows = self._visible_rows()
         n = max(1, len(rows))
         pad_v = max(4, self.height() // 14)
         pad_h = max(8, self.width() // 18)
@@ -263,6 +288,175 @@ class OverlayWindow(QWidget):
 
             y += row_h
 
+    # ---------- reset bubble ----------
+    @staticmethod
+    def _fmt_reset(ts: float | None) -> str:
+        if not ts:
+            return "초기화 시간 정보 없음"
+        try:
+            when = datetime.fromtimestamp(float(ts)).strftime("%H:%M")
+        except (OSError, ValueError, TypeError):
+            return "초기화 시간 정보 없음"
+        remain = int(float(ts) - time.time())
+        if remain <= 0:
+            return f"{when}에 초기화"
+        mins = max(1, remain // 60)
+        if mins >= 60:
+            return f"{when} 초기화 · {mins // 60}시간 {mins % 60}분 남음"
+        return f"{when} 초기화 · {mins}분 남음"
+
+    def _reset_text(self, key: str | None = None) -> str:
+        key = key or self._best_reset_key()
+        if not key:
+            return "초기화 시간 정보 없음"
+        snap = self._snapshots.get(key)
+        if snap is None:
+            return "초기화 시간 정보 없음"
+        name = _NAMES.get(key, snap.name)
+        return f"{name} {self._fmt_reset(snap.resets_at)}"
+
+    def _best_reset_key(self) -> str | None:
+        rows = [
+            (k, s) for k, s in self._snapshots.items()
+            if self._is_visible(k) and s is not None and s.available and s.resets_at
+        ]
+        if not rows:
+            fallback = [
+                (k, s) for k, s in self._snapshots.items()
+                if not k.startswith("_") and self._is_visible(k) and s is not None
+            ]
+            return fallback[0][0] if fallback else None
+        rows.sort(key=lambda item: item[1].percent_clamped(), reverse=True)
+        return rows[0][0]
+
+    def _show_bubble(self, key: str | None = None, *, seconds: int | None = None) -> None:
+        self._bubble_key = key or self._best_reset_key()
+        if self._bubble_key is None:
+            return
+        duration = int(seconds or self._BUBBLE_DURATION_SECONDS)
+        self._bubble_until = time.time() + float(duration)
+        self._show_external_bubble(self._bubble_key, duration)
+        self.update()
+
+    def _show_external_bubble(self, key: str, seconds: int) -> None:
+        pos = self.mapToGlobal(QPoint(8, self.height() + 8))
+        screen = QGuiApplication.screenAt(self.frameGeometry().center())
+        if screen is not None:
+            available = screen.availableGeometry()
+            if pos.y() + 60 > available.bottom():
+                pos = self.mapToGlobal(QPoint(8, -42))
+        QToolTip.showText(
+            pos,
+            self._reset_text(key),
+            self,
+            QRect(),
+            max(1000, seconds * 1000),
+        )
+
+    def _tick_bubble(self) -> None:
+        now = time.time()
+        if self._bubble_until and now >= self._bubble_until and self._hovered_key is None:
+            self._bubble_until = 0.0
+            self.update()
+        if now - self._last_auto_bubble >= self._BUBBLE_INTERVAL_SECONDS:
+            self._last_auto_bubble = now
+            self._show_bubble()
+
+    def _paint_reset_bubble(self, p: QPainter, rows: list[tuple[str, ProviderSnapshot]]) -> None:
+        key = self._hovered_key or (self._bubble_key if time.time() < self._bubble_until else None)
+        if key is None:
+            return
+        snap = self._snapshots.get(key)
+        if snap is None:
+            return
+
+        text = self._reset_text(key)
+        family = self._pick_font_family()
+        font = QFont(family, max(8, min(11, self.height() // 8)))
+        font.setWeight(QFont.Weight.DemiBold)
+        p.setFont(font)
+        metrics = QFontMetrics(font)
+
+        margin = 8
+        bubble_h = max(26, metrics.height() + 10)
+        bubble_w = min(self.width() - margin * 2, metrics.horizontalAdvance(text) + 24)
+        bubble_x = self.width() - margin - bubble_w
+        bubble_y = margin
+        if len(rows) <= 1 and self.height() >= bubble_h + 46:
+            bubble_y = self.height() - margin - bubble_h
+
+        rect = QRect(bubble_x, bubble_y, bubble_w, bubble_h)
+        p.setPen(QColor(255, 255, 255, 55))
+        p.setBrush(QColor(245, 247, 255, 238))
+        p.drawRoundedRect(rect, 8, 8)
+
+        tail_x = max(rect.left() + 18, min(rect.right() - 18, self.width() - 32))
+        if bubble_y <= self.height() // 2:
+            tail = QPolygon([
+                QPoint(tail_x - 6, rect.bottom()),
+                QPoint(tail_x + 6, rect.bottom()),
+                QPoint(tail_x, rect.bottom() + 7),
+            ])
+        else:
+            tail = QPolygon([
+                QPoint(tail_x - 6, rect.top()),
+                QPoint(tail_x + 6, rect.top()),
+                QPoint(tail_x, rect.top() - 7),
+            ])
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawPolygon(tail)
+
+        p.setPen(QColor(25, 31, 45, 245))
+        p.drawText(
+            rect.adjusted(11, 0, -11, 0),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            metrics.elidedText(text, Qt.TextElideMode.ElideRight, rect.width() - 22),
+        )
+
+    def _row_key_at(self, pos: QPoint) -> str | None:
+        rows = self._visible_rows()
+        if not rows:
+            return None
+        n = max(1, len(rows))
+        pad_v = max(4, self.height() // 14)
+        avail_h = self.height() - 2 * pad_v
+        row_h = max(14, avail_h // n)
+        used_h = row_h * n
+        y = pad_v + max(0, (avail_h - used_h) // 2)
+        for key, _snap in rows:
+            if QRect(0, y, self.width(), row_h).contains(pos):
+                return key
+            y += row_h
+        return None
+
+    def _is_visible(self, key: str) -> bool:
+        return not self._visible_provider_ids or key in self._visible_provider_ids
+
+    def _visible_rows(self) -> list[tuple[str, ProviderSnapshot]]:
+        return [
+            (k, s) for k, s in self._snapshots.items()
+            if not k.startswith("_") and self._is_visible(k) and s is not None
+        ]
+
+    def _toggle_provider_visibility(self, key: str, checked: bool) -> None:
+        all_keys = {
+            k for k, s in self._snapshots.items()
+            if not k.startswith("_") and s is not None
+        }
+        visible = set(self._visible_provider_ids) if self._visible_provider_ids else set(all_keys)
+        if checked:
+            visible.add(key)
+        else:
+            visible.discard(key)
+        if visible == all_keys:
+            visible.clear()
+        if not visible and all_keys:
+            visible.add(key)
+        self._visible_provider_ids = visible
+        if self._on_visibility_changed is not None:
+            self._on_visibility_changed(set(visible))
+        self.update()
+
     # ---------- interaction ----------
     def _edge_at(self, pos: QPoint) -> str | None:
         m = self._RESIZE_MARGIN
@@ -326,6 +520,14 @@ class OverlayWindow(QWidget):
             return
         # Hover — update cursor based on edge proximity
         self._update_cursor(e.position().toPoint())
+        hover_key = self._row_key_at(e.position().toPoint())
+        if hover_key != self._hovered_key:
+            self._hovered_key = hover_key
+            if hover_key is not None:
+                self._show_external_bubble(hover_key, 60)
+            else:
+                QToolTip.hideText()
+            self.update()
 
     def _apply_resize(self, global_pos: QPoint) -> None:
         assert self._resize_start_geo is not None and self._resize_start_global is not None
@@ -373,9 +575,23 @@ class OverlayWindow(QWidget):
 
     def leaveEvent(self, e) -> None:
         self.unsetCursor()
+        self._hovered_key = None
+        self._bubble_until = 0.0
+        QToolTip.hideText()
+        self.update()
 
     def contextMenuEvent(self, event) -> None:
         menu = QMenu(self)
+        provider_menu = menu.addMenu("오버레이 계정")
+        for key, snap in self._snapshots.items():
+            if key.startswith("_") or snap is None:
+                continue
+            act = QAction(_NAMES.get(key, snap.name), self)
+            act.setCheckable(True)
+            act.setChecked(self._is_visible(key))
+            act.toggled.connect(lambda checked, k=key: self._toggle_provider_visibility(k, checked))
+            provider_menu.addAction(act)
+        menu.addSeparator()
         menu.addAction("상태창 열기", self._on_open_status)
         menu.addSeparator()
         lock = QAction("위치 잠금" if not self._locked else "위치 잠금 해제", self)

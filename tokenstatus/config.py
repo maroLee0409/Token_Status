@@ -39,11 +39,47 @@ class ProviderConfig:
     org_id: str = ""
 
 
+@dataclass
+class AccountConfig:
+    id: str
+    kind: str = "claude"  # claude | codex | gemini
+    label: str = ""
+    enabled: bool = True
+    config: ProviderConfig = field(default_factory=ProviderConfig)
+
+
+def _default_accounts() -> list[AccountConfig]:
+    return [
+        AccountConfig(
+            id="claude", kind="claude", label="Claude",
+            config=ProviderConfig(
+                log_dir=str(Path.home() / ".claude" / "projects"),
+                token_limit=29_000_000,
+            ),
+        ),
+        AccountConfig(
+            id="codex", kind="codex", label="Codex",
+            config=ProviderConfig(
+                log_dir=str(Path.home() / ".codex" / "sessions"),
+                token_limit=100,
+            ),
+        ),
+        AccountConfig(
+            id="gemini", kind="gemini", label="Gemini",
+            config=ProviderConfig(
+                log_dir=str(Path.home() / ".gemini"),
+                message_limit=1500,
+            ),
+        ),
+    ]
+
+
 DISPLAY_MODES = ("standard", "compact", "minimal", "overlay")
 
 
 @dataclass
 class Config:
+    schema_version: int = 2
     refresh_seconds: int = 30
     autostart: bool = False
     show_window_on_click: bool = True
@@ -55,6 +91,7 @@ class Config:
     overlay_h: int = 110
     overlay_opacity: float = 0.85
     overlay_locked: bool = False  # lock position + size (disable drag/resize)
+    overlay_visible_ids: list[str] = field(default_factory=list)  # empty means show all
     claude: ProviderConfig = field(default_factory=lambda: ProviderConfig(
         log_dir=str(Path.home() / ".claude" / "projects"),
         token_limit=29_000_000,  # Max 5x 기준. 다른 플랜이면 설정창 프리셋 / 🎯 보정 사용.
@@ -67,6 +104,7 @@ class Config:
         log_dir=str(Path.home() / ".gemini"),
         message_limit=1500,
     ))
+    providers: list[AccountConfig] = field(default_factory=_default_accounts)
 
     @classmethod
     def load(cls) -> "Config":
@@ -83,12 +121,15 @@ class Config:
     @classmethod
     def _from_dict(cls, raw: dict[str, Any]) -> "Config":
         cfg = cls()
+        cfg.providers = []
         for key in ("refresh_seconds", "autostart", "show_window_on_click",
                     "tray_show_max_only", "display_mode",
                     "overlay_x", "overlay_y", "overlay_w", "overlay_h",
                     "overlay_opacity", "overlay_locked"):
             if key in raw:
                 setattr(cfg, key, raw[key])
+        if isinstance(raw.get("overlay_visible_ids"), list):
+            cfg.overlay_visible_ids = [str(x) for x in raw["overlay_visible_ids"]]
         if cfg.display_mode not in DISPLAY_MODES:
             cfg.display_mode = "standard"
         for provider in ("claude", "codex", "gemini"):
@@ -97,11 +138,48 @@ class Config:
                 for k, v in raw[provider].items():
                     if hasattr(current, k):
                         setattr(current, k, v)
+        if isinstance(raw.get("providers"), list):
+            cfg.providers = []
+            for item in raw["providers"]:
+                if not isinstance(item, dict):
+                    continue
+                pc_raw = item.get("config") if isinstance(item.get("config"), dict) else {}
+                pc = ProviderConfig()
+                for k, v in pc_raw.items():
+                    if hasattr(pc, k):
+                        setattr(pc, k, v)
+                kind = str(item.get("kind") or "claude")
+                if kind not in ("claude", "codex", "gemini"):
+                    kind = "claude"
+                account_id = str(item.get("id") or f"{kind}_{len(cfg.providers) + 1}")
+                cfg.providers.append(AccountConfig(
+                    id=account_id,
+                    kind=kind,
+                    label=str(item.get("label") or kind.title()),
+                    enabled=bool(item.get("enabled", True)),
+                    config=pc,
+                ))
+        if int(raw.get("schema_version", 1)) < 2:
+            migrated: list[AccountConfig] = []
+            for kind in ("claude", "codex", "gemini"):
+                pc = getattr(cfg, kind)
+                migrated.append(AccountConfig(
+                    id=kind,
+                    kind=kind,
+                    label=kind.title(),
+                    enabled=pc.enabled,
+                    config=pc,
+                ))
+            migrated.extend(cfg.providers)
+            cfg.providers = migrated
+            cfg.overlay_visible_ids = []
+        cfg.schema_version = 2
         return cfg
 
     def save(self) -> None:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         data = {
+            "schema_version": self.schema_version,
             "refresh_seconds": self.refresh_seconds,
             "autostart": self.autostart,
             "show_window_on_click": self.show_window_on_click,
@@ -113,9 +191,11 @@ class Config:
             "overlay_h": self.overlay_h,
             "overlay_opacity": self.overlay_opacity,
             "overlay_locked": self.overlay_locked,
+            "overlay_visible_ids": self.overlay_visible_ids,
             "claude": asdict(self.claude),
             "codex": asdict(self.codex),
             "gemini": asdict(self.gemini),
+            "providers": [asdict(p) for p in self.providers],
         }
         CONFIG_PATH.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
 

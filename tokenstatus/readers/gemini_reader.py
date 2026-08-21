@@ -72,6 +72,7 @@ def read_gemini(log_dir: str, window_minutes: int, message_limit: int) -> Provid
     window_start = now - window_minutes * 60
     total_msgs = 0
     last_activity = 0.0
+    active_times: list[float] = []
     paths_seen: set[str] = set()
 
     for f in candidates:
@@ -88,6 +89,7 @@ def read_gemini(log_dir: str, window_minutes: int, message_limit: int) -> Provid
         for ts in cached:
             if ts >= window_start:
                 total_msgs += 1
+                active_times.append(ts)
             if ts > last_activity:
                 last_activity = ts
 
@@ -96,6 +98,8 @@ def read_gemini(log_dir: str, window_minutes: int, message_limit: int) -> Provid
     snap.available = True
     snap.used = total_msgs
     snap.last_activity = last_activity or None
+    if active_times:
+        snap.resets_at = min(active_times) + window_minutes * 60
     if message_limit > 0:
         snap.percent = (total_msgs / message_limit) * 100.0
     snap.note = "토큰 X · 메시지 수 기반 (Gemini CLI는 토큰 카운트 미기록)"

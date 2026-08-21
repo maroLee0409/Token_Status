@@ -3,7 +3,7 @@ from __future__ import annotations
 import sys
 
 from PyQt6.QtCore import QObject, QSharedMemory, Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QIcon, QPixmap
+from PyQt6.QtGui import QAction, QColor, QIcon, QPalette, QPixmap
 from PyQt6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 import logging
@@ -16,6 +16,7 @@ from .readers import ProviderSnapshot
 from .ui.overlay_window import OverlayWindow
 from .ui.settings_window import SettingsWindow
 from .ui.status_window import StatusWindow
+from .ui.style import GLOBAL_QSS
 
 log = logging.getLogger(__name__)
 
@@ -33,6 +34,23 @@ class TokenStatusApp:
 
         self.qt = QApplication(argv)
         self.qt.setQuitOnLastWindowClosed(False)
+        self.qt.setStyle("Fusion")
+        palette = QPalette()
+        palette.setColor(QPalette.ColorRole.Window, QColor("#F7F8FA"))
+        palette.setColor(QPalette.ColorRole.WindowText, QColor("#1F2937"))
+        palette.setColor(QPalette.ColorRole.Base, QColor("#FFFFFF"))
+        palette.setColor(QPalette.ColorRole.AlternateBase, QColor("#F1F5F9"))
+        palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#F8FAFC"))
+        palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#111827"))
+        palette.setColor(QPalette.ColorRole.Text, QColor("#1F2937"))
+        palette.setColor(QPalette.ColorRole.Button, QColor("#FFFFFF"))
+        palette.setColor(QPalette.ColorRole.ButtonText, QColor("#1F2937"))
+        palette.setColor(QPalette.ColorRole.Highlight, QColor("#FFEDD5"))
+        palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#9A3412"))
+        palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.Text, QColor("#94A3B8"))
+        palette.setColor(QPalette.ColorGroup.Disabled, QPalette.ColorRole.ButtonText, QColor("#94A3B8"))
+        self.qt.setPalette(palette)
+        self.qt.setStyleSheet(GLOBAL_QSS)
 
         # Single-instance guard. If the named segment already exists, another
         # instance is running; bail out cleanly.
@@ -190,10 +208,12 @@ class TokenStatusApp:
             on_switch_mode=self._switch_mode_from_overlay,
             on_quit=self._quit,
             on_position_changed=self._save_overlay_pos,
+            on_visibility_changed=self._save_overlay_visibility,
             on_size_changed=self._save_overlay_size,
             on_lock_changed=self._set_overlay_locked,
             opacity=self.cfg.overlay_opacity,
             locked=self.cfg.overlay_locked,
+            visible_provider_ids=set(self.cfg.overlay_visible_ids),
             width=self.cfg.overlay_w,
             height=self.cfg.overlay_h,
         )
@@ -213,6 +233,13 @@ class TokenStatusApp:
     def _save_overlay_size(self, w: int, h: int) -> None:
         self.cfg.overlay_w = w
         self.cfg.overlay_h = h
+        try:
+            self.cfg.save()
+        except OSError:
+            pass
+
+    def _save_overlay_visibility(self, visible_ids: set[str]) -> None:
+        self.cfg.overlay_visible_ids = sorted(visible_ids)
         try:
             self.cfg.save()
         except OSError:
@@ -318,9 +345,8 @@ class TokenStatusApp:
 
         # Tooltip with full breakdown.
         lines = []
-        for key in ("claude", "codex", "gemini"):
-            snap = snapshots.get(key)
-            if not snap:
+        for key, snap in snapshots.items():
+            if str(key).startswith("_") or not snap:
                 continue
             if not snap.available:
                 lines.append(f"{snap.name}: 측정 불가")

@@ -4,10 +4,11 @@ import time
 from datetime import datetime
 from typing import Callable
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QGuiApplication
 from PyQt6.QtWidgets import (
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QProgressBar,
@@ -27,10 +28,10 @@ def _fmt_age(ts: float | None) -> str:
     if diff < 60:
         return f"{int(diff)}초 전"
     if diff < 3600:
-        return f"{int(diff/60)}분 전"
+        return f"{int(diff / 60)}분 전"
     if diff < 86400:
-        return f"{int(diff/3600)}시간 전"
-    return f"{int(diff/86400)}일 전"
+        return f"{int(diff / 3600)}시간 전"
+    return f"{int(diff / 86400)}일 전"
 
 
 def _fmt_resets(ts: float | None) -> str:
@@ -46,9 +47,9 @@ def _fmt_number(n: int, unit: str) -> str:
     if unit == "%":
         return f"{n}%"
     if n >= 1_000_000:
-        return f"{n/1_000_000:.1f}M {unit}"
+        return f"{n / 1_000_000:.1f}M {unit}"
     if n >= 1_000:
-        return f"{n/1_000:.1f}K {unit}"
+        return f"{n / 1_000:.1f}K {unit}"
     return f"{n:,} {unit}"
 
 
@@ -64,12 +65,12 @@ class ProviderCard(QFrame):
     def _build(self) -> None:
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(16, 14, 16, 14)
-        self._layout.setSpacing(6)
+        self._layout.setSpacing(7)
 
         top = QHBoxLayout()
-        self.name_label = QLabel("—")
+        self.name_label = QLabel("-")
         self.name_label.setObjectName("providerName")
-        self.percent_label = QLabel("—")
+        self.percent_label = QLabel("-")
         self.percent_label.setObjectName("bigPercent")
         self.percent_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
         top.addWidget(self.name_label)
@@ -83,11 +84,11 @@ class ProviderCard(QFrame):
         self.bar.setTextVisible(False)
         self._layout.addWidget(self.bar)
 
-        self.window_label = QLabel("—")
+        self.window_label = QLabel("-")
         self.window_label.setObjectName("metaLabel")
         self._layout.addWidget(self.window_label)
 
-        self.detail_label = QLabel("—")
+        self.detail_label = QLabel("-")
         self.detail_label.setObjectName("metaLabel")
         self.detail_label.setWordWrap(True)
         self._layout.addWidget(self.detail_label)
@@ -98,8 +99,6 @@ class ProviderCard(QFrame):
 
     def set_display_mode(self, mode: str) -> None:
         self._mode = mode if mode in ("standard", "compact", "minimal") else "standard"
-        # Standard: all widgets, full padding. Compact: hide details/secondary, smaller padding,
-        # thinner bar. Minimal: hide bar + all meta, just name + %.
         show_bar = self._mode != "minimal"
         show_meta = self._mode == "standard"
         self.bar.setVisible(show_bar)
@@ -109,25 +108,22 @@ class ProviderCard(QFrame):
 
         if self._mode == "standard":
             self._layout.setContentsMargins(16, 14, 16, 14)
-            self._layout.setSpacing(6)
             self.bar.setFixedHeight(10)
-            self.percent_label.setStyleSheet("font-size: 28px; font-weight: 700;")
+            self.percent_label.setStyleSheet("font-size: 28px; font-weight: 750;")
         elif self._mode == "compact":
             self._layout.setContentsMargins(14, 10, 14, 10)
-            self._layout.setSpacing(4)
-            self.bar.setFixedHeight(6)
-            self.percent_label.setStyleSheet("font-size: 22px; font-weight: 700;")
-        else:  # minimal
-            self._layout.setContentsMargins(14, 8, 14, 8)
-            self._layout.setSpacing(0)
-            self.percent_label.setStyleSheet("font-size: 18px; font-weight: 700;")
+            self.bar.setFixedHeight(7)
+            self.percent_label.setStyleSheet("font-size: 22px; font-weight: 750;")
+        else:
+            self._layout.setContentsMargins(14, 9, 14, 9)
+            self.percent_label.setStyleSheet("font-size: 18px; font-weight: 750;")
 
     def update_snapshot(self, snap: ProviderSnapshot | None) -> None:
         if snap is None:
-            self.name_label.setText("—")
-            self.percent_label.setText("—")
+            self.name_label.setText("-")
+            self.percent_label.setText("-")
             self.bar.setValue(0)
-            self.window_label.setText("비활성화됨")
+            self.window_label.setText("비활성")
             self.detail_label.setText("")
             self.secondary_label.setText("")
             return
@@ -136,9 +132,8 @@ class ProviderCard(QFrame):
         pct = snap.percent_clamped()
         self.percent_label.setText(f"{pct:.1f}%")
         self.bar.setValue(min(100, int(pct)))
-        c = bar_color(pct)
         self.bar.setStyleSheet(
-            f"QProgressBar::chunk {{ background: {c}; border-radius: 5px; }}"
+            f"QProgressBar::chunk {{ background: {bar_color(pct)}; border-radius: 5px; }}"
         )
 
         if not snap.available:
@@ -147,19 +142,19 @@ class ProviderCard(QFrame):
             self.secondary_label.setText("")
             return
 
-        self.window_label.setText(snap.window_label)
         used_txt = _fmt_number(snap.used, snap.unit)
-        limit_txt = _fmt_number(snap.limit, snap.unit) if snap.limit else "—"
-        activity = _fmt_age(snap.last_activity)
+        limit_txt = _fmt_number(snap.limit, snap.unit) if snap.limit else "-"
+        self.window_label.setText(snap.window_label)
         self.detail_label.setText(
-            f"사용: {used_txt} / 한도: {limit_txt} · 마지막 활동: {activity}\n{snap.note}"
+            f"사용 {used_txt} / 한도 {limit_txt} · 마지막 활동 {_fmt_age(snap.last_activity)}\n"
+            f"{snap.note}"
         )
 
         bits: list[str] = []
         if snap.secondary_percent is not None and snap.secondary_label:
             bits.append(f"{snap.secondary_label}: {snap.secondary_percent:.1f}%")
         if snap.resets_at:
-            bits.append(f"리셋: {_fmt_resets(snap.resets_at)}")
+            bits.append(f"초기화: {_fmt_resets(snap.resets_at)}")
         self.secondary_label.setText("  ·  ".join(bits))
 
 
@@ -177,8 +172,8 @@ class StatusWindow(QWidget):
         self.setWindowTitle("Token Status")
         self.setObjectName("root")
         self.setStyleSheet(GLOBAL_QSS)
-        self.setMinimumWidth(280)
-        self.resize(420, self.sizeHint().height())
+        self.setMinimumSize(520, 360)
+        self.resize(700, 460)
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, False)
         self._cards: dict[str, ProviderCard] = {}
         self._last_update: float = 0.0
@@ -186,77 +181,121 @@ class StatusWindow(QWidget):
 
     def _build(self) -> None:
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(14, 12, 14, 12)
-        outer.setSpacing(10)
+        outer.setContentsMargins(16, 14, 16, 14)
+        outer.setSpacing(12)
 
         header = QHBoxLayout()
-        title = QLabel("토큰 사용량")
+        title = QLabel("Token Status")
         title.setObjectName("title")
-        self.subtitle = QLabel("실시간 모니터링")
+        self.subtitle = QLabel("실시간 대시보드")
         self.subtitle.setObjectName("subtitle")
-        gear = QPushButton("⚙")
-        gear.setToolTip("설정")
-        gear.setFixedSize(28, 28)
-        gear.setStyleSheet(
-            "QPushButton { font-size: 16px; padding: 0px; border-radius: 14px; }"
-        )
+        gear = QPushButton("설정")
+        gear.setToolTip("계정 및 표시 설정 열기")
+        gear.setMinimumWidth(64)
+        gear.setFixedHeight(34)
         gear.clicked.connect(self._on_settings)
+        refresh = QPushButton("새로고침")
+        refresh.setToolTip("사용량 지금 갱신")
+        refresh.setFixedHeight(34)
+        refresh.clicked.connect(self._on_refresh)
         header.addWidget(title)
         header.addStretch(1)
         header.addWidget(self.subtitle)
         header.addSpacing(8)
+        header.addWidget(refresh)
+        header.addSpacing(6)
         header.addWidget(gear)
         outer.addLayout(header)
 
-        for key in ("claude", "codex", "gemini"):
-            card = ProviderCard(key, display_mode=self._display_mode)
-            self._cards[key] = card
-            outer.addWidget(card)
+        summary = QFrame()
+        summary.setObjectName("summaryBand")
+        summary_layout = QHBoxLayout(summary)
+        summary_layout.setContentsMargins(16, 12, 16, 12)
+        summary_layout.setSpacing(18)
+        self.max_label = QLabel("No data")
+        self.max_label.setObjectName("summaryMetric")
+        self.count_label = QLabel("0 active")
+        self.count_label.setObjectName("summaryMeta")
+        self.reset_label = QLabel("Reset time unknown")
+        self.reset_label.setObjectName("summaryMeta")
+        summary_layout.addWidget(self.max_label)
+        summary_layout.addWidget(self.count_label)
+        summary_layout.addStretch(1)
+        summary_layout.addWidget(self.reset_label)
+        outer.addWidget(summary)
 
+        self.cards_wrap = QWidget()
+        self.cards_layout = QGridLayout(self.cards_wrap)
+        self.cards_layout.setContentsMargins(0, 0, 0, 0)
+        self.cards_layout.setHorizontalSpacing(10)
+        self.cards_layout.setVerticalSpacing(10)
+        outer.addWidget(self.cards_wrap, 0, Qt.AlignmentFlag.AlignTop)
         outer.addStretch(1)
-
-        btns = QHBoxLayout()
-        refresh = QPushButton("새로고침")
-        refresh.clicked.connect(self._on_refresh)
-        settings = QPushButton("설정")
-        settings.setObjectName("primary")
-        settings.clicked.connect(self._on_settings)
-        btns.addWidget(refresh)
-        btns.addStretch(1)
-        btns.addWidget(settings)
-        outer.addLayout(btns)
 
     def set_display_mode(self, mode: str) -> None:
         self._display_mode = mode
         for card in self._cards.values():
             card.set_display_mode(mode)
-        self.adjustSize()
 
     def apply_snapshots(self, snapshots: dict) -> None:
         self._last_update = time.time()
-        self.subtitle.setText(f"마지막 갱신: {datetime.now().strftime('%H:%M:%S')}")
-        for key, card in self._cards.items():
-            snap = snapshots.get(key)
-            if snap is None:
-                card.setVisible(False)
-            else:
-                card.setVisible(True)
-                card.update_snapshot(snap)
-        # Shrink window to fit the visible cards.
-        self.adjustSize()
+        self.subtitle.setText(f"마지막 갱신 {datetime.now().strftime('%H:%M:%S')}")
+        visible = [
+            (str(k), s) for k, s in snapshots.items()
+            if not str(k).startswith("_") and s is not None
+        ]
+        visible_keys = {k for k, _s in visible}
+
+        for key, _snap in visible:
+            if key not in self._cards:
+                self._cards[key] = ProviderCard(key, display_mode=self._display_mode)
+        for key in list(self._cards.keys()):
+            if key not in visible_keys:
+                card = self._cards.pop(key)
+                self.cards_layout.removeWidget(card)
+                card.deleteLater()
+
+        while self.cards_layout.count():
+            item = self.cards_layout.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.setParent(None)
+
+        active = [s for _k, s in visible if s.available]
+        if active:
+            max_snap = max(active, key=lambda s: s.percent_clamped())
+            self.max_label.setText(
+                f"최고 사용률 · {max_snap.name} {max_snap.percent_clamped():.1f}%"
+            )
+            self.count_label.setText(f"활성 계정 {len(active)}개")
+            reset_candidates = [s for s in active if s.resets_at and s.resets_at > time.time()]
+            next_reset = min(reset_candidates, key=lambda s: s.resets_at) if reset_candidates else None
+            reset = _fmt_resets(next_reset.resets_at) if next_reset else ""
+            self.reset_label.setText(
+                f"가장 가까운 초기화 · {next_reset.name} {reset}"
+                if reset and next_reset else "초기화 시간 없음"
+            )
+        else:
+            self.max_label.setText("No data")
+            self.count_label.setText("0 active")
+            self.reset_label.setText("초기화 시간 없음")
+
+        for idx, (key, snap) in enumerate(visible):
+            card = self._cards[key]
+            card.setVisible(True)
+            card.update_snapshot(snap)
+            self.cards_layout.addWidget(card, idx // 2, idx % 2)
 
     def show_near_tray(self) -> None:
-        """Position the window in the bottom-right, but always fully on-screen."""
         screen = QGuiApplication.primaryScreen()
         if screen is None:
             self.show()
             self.activateWindow()
             return
         geom = screen.availableGeometry()
-        size = self.sizeHint()
-        # Cap width to fit the work area (taskbar excluded).
-        w = min(max(self.minimumWidth(), size.width()), geom.width() - 24)
-        h = min(size.height(), geom.height() - 24)
+        w = min(max(self.minimumWidth(), self.width()), geom.width() - 24)
+        content_h = 14 + 34 + 12 + 88 + 12 + self.cards_wrap.sizeHint().height() + 28
+        h = min(max(self.minimumHeight(), content_h), geom.height() - 24)
         x = max(geom.left() + 12, geom.right() - w - 12)
         y = max(geom.top() + 12, geom.bottom() - h - 12)
         self.setGeometry(x, y, w, h)

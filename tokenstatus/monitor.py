@@ -76,17 +76,23 @@ class Monitor:
     def _collect(self) -> SnapshotMap:
         cfg = self._config_getter()
         out: SnapshotMap = {}
-        if cfg.claude.enabled:
-            out["claude"] = read_claude(
-                cfg.claude.log_dir, cfg.claude.window_minutes, cfg.claude.token_limit,
-                use_api=cfg.claude.use_api, org_id=cfg.claude.org_id,
-            )
-        if cfg.codex.enabled:
-            out["codex"] = read_codex(
-                cfg.codex.log_dir, cfg.codex.window_minutes, cfg.codex.token_limit
-            )
-        if cfg.gemini.enabled:
-            out["gemini"] = read_gemini(
-                cfg.gemini.log_dir, cfg.gemini.window_minutes, cfg.gemini.message_limit
-            )
+        for account in cfg.providers:
+            if not account.enabled:
+                continue
+            key = account.id
+            pc = account.config
+            if account.kind == "claude":
+                snap = read_claude(
+                    pc.log_dir, pc.window_minutes, pc.token_limit,
+                    use_api=pc.use_api, org_id=pc.org_id,
+                )
+            elif account.kind == "codex":
+                snap = read_codex(pc.log_dir, pc.window_minutes, pc.token_limit)
+            elif account.kind == "gemini":
+                snap = read_gemini(pc.log_dir, pc.window_minutes, pc.message_limit)
+            else:
+                continue
+            if account.label:
+                snap.name = account.label
+            out[key] = snap
         return out

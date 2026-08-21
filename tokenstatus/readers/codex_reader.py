@@ -9,6 +9,9 @@ from typing import Optional
 from .base import ProviderSnapshot
 
 
+_RECENT_FILES_TO_SCAN = 25
+
+
 def _parse_ts(s: str) -> float:
     try:
         if s.endswith("Z"):
@@ -24,14 +27,13 @@ def _latest_rate_limit(path: Path) -> Optional[dict]:
         with path.open("rb") as f:
             f.seek(0, 2)
             size = f.tell()
-            # Read in chunks from the end backwards (cap at 256KB for safety).
             chunk = min(size, 256 * 1024)
             f.seek(max(0, size - chunk))
             tail = f.read().decode("utf-8", errors="replace")
     except OSError:
         return None
-    lines = tail.splitlines()
-    for line in reversed(lines):
+
+    for line in reversed(tail.splitlines()):
         line = line.strip()
         if not line or '"token_count"' not in line:
             continue
@@ -42,22 +44,41 @@ def _latest_rate_limit(path: Path) -> Optional[dict]:
         payload = obj.get("payload")
         if not isinstance(payload, dict) or payload.get("type") != "token_count":
             continue
-        rl = payload.get("rate_limits")
-        if isinstance(rl, dict):
-            rl["_timestamp"] = _parse_ts(obj.get("timestamp", ""))
-            return rl
+        rate_limits = payload.get("rate_limits")
+        if isinstance(rate_limits, dict):
+            rate_limits["_timestamp"] = _parse_ts(obj.get("timestamp", ""))
+            return rate_limits
     return None
+
+
+def _fmt_window(minutes: int | float | None) -> str:
+    try:
+        minutes_i = int(minutes or 0)
+    except (TypeError, ValueError):
+        minutes_i = 0
+    if minutes_i <= 0:
+        return "Codex official"
+    if minutes_i % 10080 == 0:
+        weeks = minutes_i // 10080
+        return f"{weeks}w (Codex official)"
+    if minutes_i % 1440 == 0:
+        days = minutes_i // 1440
+        return f"{days}d (Codex official)"
+    if minutes_i % 60 == 0:
+        hours = minutes_i // 60
+        return f"{hours}h (Codex official)"
+    return f"{minutes_i}m (Codex official)"
 
 
 def read_codex(log_dir: str, window_minutes: int, token_limit: int) -> ProviderSnapshot:
     snap = ProviderSnapshot(
         name="Codex",
         unit="%",
-        window_label="5시간 (Codex 공식)",
+        window_label="Codex official",
     )
     root = Path(log_dir)
     if not root.exists():
-        snap.note = f"로그 폴더 없음: {log_dir}"
+        snap.note = f"Log folder not found: {log_dir}"
         return snap
 
     files = sorted(
@@ -67,31 +88,32 @@ def read_codex(log_dir: str, window_minutes: int, token_limit: int) -> ProviderS
     )
     if not files:
         snap.available = True
-        snap.note = "Codex 세션 없음"
+        snap.note = "No Codex sessions found"
         return snap
 
-    # Look at the 5 most recent files until we find a token_count event.
-    rate = None
-    last_path = None
-    for f in files[:5]:
+    candidates: list[tuple[float, dict, Path]] = []
+    last_path: Path | None = None
+    for f in files[:_RECENT_FILES_TO_SCAN]:
         rate = _latest_rate_limit(f)
         if rate is not None:
+            candidates.append((float(rate.get("_timestamp") or 0.0), rate, f))
+        elif last_path is None:
             last_path = f
-            break
 
-    if rate is None:
+    if not candidates:
         snap.available = True
-        snap.note = "최근 세션에 token_count 이벤트 없음"
-        if last_path is None and files:
-            try:
-                snap.last_activity = files[0].stat().st_mtime
-            except OSError:
-                pass
+        snap.note = "No token_count rate-limit event in recent Codex sessions"
+        try:
+            snap.last_activity = files[0].stat().st_mtime
+        except OSError:
+            pass
         return snap
 
+    _ts, rate, last_path = max(candidates, key=lambda item: item[0])
     primary = rate.get("primary") or {}
     secondary = rate.get("secondary") or {}
     now = time.time()
+
     primary_pct = float(primary.get("used_percent") or 0.0)
     primary_resets = primary.get("resets_at")
     primary_stale = bool(primary_resets and now >= float(primary_resets))
@@ -109,14 +131,13 @@ def read_codex(log_dir: str, window_minutes: int, token_limit: int) -> ProviderS
     snap.used = int(primary_pct)
     snap.resets_at = primary_resets
     snap.secondary_percent = secondary_pct
-    snap.secondary_label = (
-        f"주간 (≈{(secondary.get('window_minutes') or 0) // 60}h)"
-        if secondary else None
-    )
-    plan = rate.get("plan_type") or "?"
-    notes = [f"플랜: {plan}", "Codex 자체 보고 %"]
+    snap.secondary_label = _fmt_window(secondary.get("window_minutes")) if secondary else None
+    snap.window_label = _fmt_window(primary.get("window_minutes"))
+
+    plan = rate.get("plan_type") or "unknown"
+    notes = [f"plan: {plan}", "Codex reported rate_limits"]
     if primary_stale:
-        notes.append("윈도우 리셋됨")
-    snap.note = " · ".join(notes)
-    snap.last_activity = rate.get("_timestamp") or (last_path.stat().st_mtime if last_path else None)
+        notes.append("window reset")
+    snap.note = " | ".join(notes)
+    snap.last_activity = rate.get("_timestamp") or last_path.stat().st_mtime
     return snap

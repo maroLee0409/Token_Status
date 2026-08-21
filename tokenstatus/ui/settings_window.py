@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+from uuid import uuid4
 from typing import Callable
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QDialog,
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -15,6 +17,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -26,7 +29,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QGuiApplication
 
 from .. import autostart
-from ..config import CLAUDE_PRESETS, GEMINI_PRESETS, Config, ProviderConfig
+from ..config import AccountConfig, CLAUDE_PRESETS, GEMINI_PRESETS, Config, ProviderConfig
 from ..readers import read_claude
 from ..readers.claude_api import (
     delete_session_key,
@@ -36,6 +39,100 @@ from ..readers.claude_api import (
     save_session_key,
 )
 from .style import ACCENT, GLOBAL_QSS, MUTED
+
+
+def _style_combo_popup(combo: QComboBox) -> None:
+    combo.view().setStyleSheet(
+        "QAbstractItemView { background: #FFFFFF; color: #1F2937; "
+        "border: 1px solid #94A3B8; outline: none; padding: 4px; } "
+        "QAbstractItemView::item { min-height: 30px; padding: 4px 8px; } "
+        "QAbstractItemView::item:selected { background: #FFEDD5; color: #9A3412; }"
+    )
+
+
+class ProviderChoiceRow(QFrame):
+    selected = pyqtSignal(str)
+
+    def __init__(self, kind: str, name: str, description: str) -> None:
+        super().__init__()
+        self.kind = kind
+        self.setObjectName("providerChoiceRow")
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setMinimumHeight(72)
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(14, 11, 14, 11)
+        layout.setSpacing(12)
+
+        badge = QLabel(name[0])
+        badge.setObjectName(f"providerBadge_{kind}")
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setFixedSize(38, 38)
+        layout.addWidget(badge)
+
+        copy = QVBoxLayout()
+        copy.setSpacing(2)
+        name_label = QLabel(name)
+        name_label.setObjectName("providerChoiceName")
+        description_label = QLabel(description)
+        description_label.setObjectName("providerChoiceDescription")
+        copy.addWidget(name_label)
+        copy.addWidget(description_label)
+        layout.addLayout(copy, 1)
+
+        action = QLabel("선택")
+        action.setObjectName("providerChoiceAction")
+        layout.addWidget(action)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and self.rect().contains(event.position().toPoint()):
+            self.selected.emit(self.kind)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class AccountTypeDialog(QDialog):
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.selected_kind: str | None = None
+        self.setWindowTitle("계정 추가")
+        self.setModal(True)
+        self.setObjectName("accountTypeDialog")
+        self.setStyleSheet(GLOBAL_QSS)
+        self.setFixedWidth(460)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(24, 22, 24, 20)
+        outer.setSpacing(16)
+
+        title = QLabel("서비스 선택")
+        title.setObjectName("dialogTitle")
+        outer.addWidget(title)
+
+        subtitle = QLabel("추가할 계정의 서비스를 선택하세요.")
+        subtitle.setObjectName("subtitle")
+        outer.addWidget(subtitle)
+
+        choices = QVBoxLayout()
+        choices.setSpacing(8)
+        for kind, name, description in (
+            ("claude", "Claude", "Claude Code 사용량 및 초기화 시간"),
+            ("codex", "Codex", "Codex 세션이 보고한 공식 사용률"),
+            ("gemini", "Gemini", "Gemini CLI 메시지 사용량 추정"),
+        ):
+            row = ProviderChoiceRow(kind, name, description)
+            row.selected.connect(self._select)
+            choices.addWidget(row)
+        outer.addLayout(choices)
+
+        cancel = QPushButton("취소")
+        cancel.clicked.connect(self.reject)
+        outer.addWidget(cancel, 0, Qt.AlignmentFlag.AlignRight)
+
+    def _select(self, kind: str) -> None:
+        self.selected_kind = kind
+        self.accept()
 
 
 class ProviderTab(QWidget):
@@ -127,6 +224,7 @@ class ProviderTab(QWidget):
 
             if presets:
                 self.preset_box = QComboBox()
+                _style_combo_popup(self.preset_box)
                 self.preset_box.addItems(list(presets.keys()))
                 # Pre-select preset that matches current value, else "Custom".
                 current_value = int(self.limit_spin.value())
@@ -379,10 +477,11 @@ class GeneralTab(QWidget):
         form.addRow("새로고침 주기", self.refresh)
 
         self.display_mode = QComboBox()
-        self.display_mode.addItem("표준 — 모든 정보", "standard")
-        self.display_mode.addItem("간소 — % + 막대만", "compact")
-        self.display_mode.addItem("최소 — 한 줄 (이름 + %)", "minimal")
-        self.display_mode.addItem("오버레이 — 항상 위 반투명 HUD", "overlay")
+        _style_combo_popup(self.display_mode)
+        self.display_mode.addItem("표준", "standard")
+        self.display_mode.addItem("간소", "compact")
+        self.display_mode.addItem("최소", "minimal")
+        self.display_mode.addItem("오버레이", "overlay")
         modes = ["standard", "compact", "minimal", "overlay"]
         current_idx = modes.index(cfg.display_mode) if cfg.display_mode in modes else 0
         self.display_mode.setCurrentIndex(current_idx)
@@ -445,6 +544,232 @@ class GeneralTab(QWidget):
         self.cfg.overlay_locked = self.overlay_locked.isChecked()
 
 
+class AccountsTab(QWidget):
+    def __init__(self, cfg: Config) -> None:
+        super().__init__()
+        self.cfg = cfg
+        self._build()
+        self._refresh_list()
+
+    def _build(self) -> None:
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(16, 16, 16, 16)
+        outer.setSpacing(12)
+
+        left = QVBoxLayout()
+        self.list = QListWidget()
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.list.currentRowChanged.connect(self._load_selected)
+        left.addWidget(self.list, 1)
+
+        add_account = QPushButton("+  계정 추가")
+        add_account.setObjectName("accountAdd")
+        add_account.setToolTip("Claude, Codex 또는 Gemini 계정 추가")
+        add_account.setMinimumWidth(210)
+        add_account.clicked.connect(self._choose_account_type)
+        left.addWidget(add_account)
+
+        self.delete_btn = QPushButton("선택 삭제")
+        self.delete_btn.clicked.connect(self._delete_selected)
+        self.delete_btn.setMinimumWidth(210)
+        left.addWidget(self.delete_btn)
+        outer.addLayout(left, 1)
+
+        form_wrap = QWidget()
+        form = QFormLayout(form_wrap)
+        form.setSpacing(10)
+        self.enabled = QCheckBox("모니터링 사용")
+        form.addRow("", self.enabled)
+        self.label = QLineEdit()
+        form.addRow("표시 이름", self.label)
+        self.kind = QComboBox()
+        _style_combo_popup(self.kind)
+        self.kind.addItem("Claude", "claude")
+        self.kind.addItem("Codex", "codex")
+        self.kind.addItem("Gemini", "gemini")
+        self.provider_info = QLabel("")
+        self.provider_info.setObjectName("subtitle")
+        self.provider_info.setWordWrap(True)
+        form.addRow("종류", self.kind)
+        self.log_dir = QLineEdit()
+        form.addRow("", self.provider_info)
+        browse = QPushButton("폴더 선택")
+        browse.clicked.connect(self._browse)
+        path_row = QHBoxLayout()
+        path_row.addWidget(self.log_dir, 1)
+        path_row.addWidget(browse)
+        path_wrap = QWidget()
+        path_wrap.setLayout(path_row)
+        form.addRow("로그 폴더", path_wrap)
+        self.window_min = QSpinBox()
+        self.window_min.setRange(15, 10080)
+        self.window_min.setSingleStep(15)
+        self.window_min.setSuffix(" 분")
+        form.addRow("측정 창", self.window_min)
+        self.token_limit = QSpinBox()
+        self.token_limit.setRange(1, 1_000_000_000)
+        self.token_limit.setGroupSeparatorShown(True)
+        form.addRow("토큰 한도", self.token_limit)
+        self.message_limit = QSpinBox()
+        self.message_limit.setRange(1, 1_000_000_000)
+        self.message_limit.setGroupSeparatorShown(True)
+        form.addRow("메시지 한도", self.message_limit)
+        self.use_api = QCheckBox("Claude API 사용")
+        form.addRow("", self.use_api)
+        self.form = form
+        outer.addWidget(form_wrap, 2)
+        outer.setStretch(0, 0)
+        outer.setStretch(1, 1)
+        self.list.setFixedWidth(210)
+        form_wrap.setMinimumWidth(460)
+        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        for row in range(form.rowCount()):
+            label_item = form.itemAt(row, QFormLayout.ItemRole.LabelRole)
+            if label_item is not None and label_item.widget() is not None:
+                label_item.widget().setMinimumWidth(92)
+
+        for widget in (
+            self.enabled, self.label, self.kind, self.log_dir, self.window_min,
+            self.token_limit, self.message_limit, self.use_api,
+        ):
+            signal = getattr(widget, "textChanged", None) or getattr(widget, "valueChanged", None)
+            if signal is not None:
+                signal.connect(self._save_selected)
+        self.enabled.toggled.connect(self._save_selected)
+        self.kind.currentIndexChanged.connect(self._save_selected)
+        self.kind.currentIndexChanged.connect(self._update_provider_fields)
+        self.use_api.toggled.connect(self._save_selected)
+        self.use_api.toggled.connect(self._update_provider_fields)
+
+    def _default_config(self, kind: str) -> ProviderConfig:
+        if kind == "codex":
+            return ProviderConfig(log_dir=str(Path.home() / ".codex" / "sessions"), token_limit=100)
+        if kind == "gemini":
+            return ProviderConfig(log_dir=str(Path.home() / ".gemini"), message_limit=1500)
+        return ProviderConfig(log_dir=str(Path.home() / ".claude" / "projects"), token_limit=29_000_000)
+
+    def _choose_account_type(self) -> None:
+        dialog = AccountTypeDialog(self)
+        if dialog.exec() and dialog.selected_kind:
+            self._add_account(dialog.selected_kind)
+
+    def _add_account(self, kind: str) -> None:
+        label = {"claude": "Claude", "codex": "Codex", "gemini": "Gemini"}[kind]
+        account = AccountConfig(
+            id=f"{kind}_{uuid4().hex[:8]}",
+            kind=kind,
+            label=f"{label} {len(self.cfg.providers) + 1}",
+            config=self._default_config(kind),
+        )
+        self.cfg.providers.append(account)
+        self._refresh_list()
+        self.list.setCurrentRow(len(self.cfg.providers) - 1)
+
+    def _delete_selected(self) -> None:
+        row = self.list.currentRow()
+        if row < 0 or row >= len(self.cfg.providers):
+            return
+        self.cfg.providers.pop(row)
+        self._refresh_list()
+        self.list.setCurrentRow(min(row, len(self.cfg.providers) - 1))
+
+    def _refresh_list(self) -> None:
+        self.list.blockSignals(True)
+        self.list.clear()
+        for account in self.cfg.providers:
+            state = "" if account.enabled else " (꺼짐)"
+            self.list.addItem(f"{account.label or account.kind.title()} · {account.kind}{state}")
+        self.list.blockSignals(False)
+        self._load_selected(self.list.currentRow())
+
+    def _load_selected(self, row: int) -> None:
+        enabled = 0 <= row < len(self.cfg.providers)
+        for widget in (
+            self.enabled, self.label, self.kind, self.log_dir, self.window_min,
+            self.token_limit, self.message_limit, self.use_api, self.delete_btn,
+        ):
+            widget.setEnabled(enabled)
+        if not enabled:
+            return
+        account = self.cfg.providers[row]
+        pc = account.config
+        self.enabled.blockSignals(True)
+        self.label.blockSignals(True)
+        self.kind.blockSignals(True)
+        self.log_dir.blockSignals(True)
+        self.window_min.blockSignals(True)
+        self.token_limit.blockSignals(True)
+        self.message_limit.blockSignals(True)
+        self.use_api.blockSignals(True)
+        self.enabled.setChecked(account.enabled)
+        self.label.setText(account.label)
+        self.kind.setCurrentIndex(max(0, self.kind.findData(account.kind)))
+        self.log_dir.setText(pc.log_dir)
+        self.window_min.setValue(pc.window_minutes)
+        self.token_limit.setValue(pc.token_limit)
+        self.message_limit.setValue(pc.message_limit)
+        self.use_api.setChecked(pc.use_api)
+        self.enabled.blockSignals(False)
+        self.label.blockSignals(False)
+        self.kind.blockSignals(False)
+        self.log_dir.blockSignals(False)
+        self.window_min.blockSignals(False)
+        self.token_limit.blockSignals(False)
+        self.message_limit.blockSignals(False)
+        self.use_api.blockSignals(False)
+        self._update_provider_fields()
+
+    def _update_provider_fields(self, *_args) -> None:
+        kind = self.kind.currentData() or "claude"
+        descriptions = {
+            "claude": (
+                "공식 API 사용 시 Claude가 보고한 사용량을 표시합니다. "
+                "끄면 로컬 로그와 토큰 한도로 추정합니다."
+            ),
+            "codex": "Codex 세션 로그가 보고한 사용률과 초기화 시간을 그대로 표시합니다.",
+            "gemini": "로컬 기록의 메시지 수를 설정한 한도와 비교한 추정값입니다.",
+        }
+        self.provider_info.setText(descriptions[kind])
+        for widget, visible in (
+            (self.token_limit, kind == "claude" and not self.use_api.isChecked()),
+            (self.message_limit, kind == "gemini"),
+            (self.use_api, kind == "claude"),
+        ):
+            widget.setVisible(visible)
+            label = self.form.labelForField(widget)
+            if label is not None:
+                label.setVisible(visible)
+
+    def _save_selected(self, *_args) -> None:
+        row = self.list.currentRow()
+        if row < 0 or row >= len(self.cfg.providers):
+            return
+        account = self.cfg.providers[row]
+        account.enabled = self.enabled.isChecked()
+        account.label = self.label.text().strip() or self.kind.currentText()
+        account.kind = self.kind.currentData() or "claude"
+        pc = account.config
+        pc.log_dir = self.log_dir.text().strip()
+        pc.window_minutes = int(self.window_min.value())
+        pc.token_limit = int(self.token_limit.value())
+        pc.message_limit = int(self.message_limit.value())
+        pc.use_api = self.use_api.isChecked()
+        current = self.list.currentRow()
+        self._refresh_list()
+        self.list.setCurrentRow(current)
+
+    def _browse(self) -> None:
+        start = self.log_dir.text() or str(Path.home())
+        chosen = QFileDialog.getExistingDirectory(self, "로그 폴더 선택", start)
+        if chosen:
+            self.log_dir.setText(chosen)
+
+    def write_back(self) -> None:
+        self._save_selected()
+
+
 class SettingsWindow(QWidget):
     def __init__(
         self,
@@ -459,7 +784,8 @@ class SettingsWindow(QWidget):
         self.setWindowTitle("Token Status — 설정")
         self.setObjectName("root")
         self.setStyleSheet(GLOBAL_QSS)
-        self.resize(540, 460)
+        self.setMinimumSize(720, 500)
+        self.resize(820, 580)
         self._build()
 
     def _build(self) -> None:
@@ -473,6 +799,7 @@ class SettingsWindow(QWidget):
 
         self.tabs = QTabWidget()
         self.general_tab = GeneralTab(self.cfg, on_reset_overlay=self._on_reset_overlay)
+        self.accounts_tab = AccountsTab(self.cfg)
         self.claude_tab = ProviderTab(
             "claude", self.cfg.claude,
             title="Claude Code", unit_label="tokens", limit_field="token_limit",
@@ -495,9 +822,13 @@ class SettingsWindow(QWidget):
             help_text="Gemini CLI는 토큰 카운트를 기록하지 않아 메시지 수 기반 추정입니다.",
         )
         self.tabs.addTab(self._scrollable(self.general_tab), "일반")
+        self.tabs.addTab(self._scrollable(self.accounts_tab), "추가 계정")
         self.tabs.addTab(self._scrollable(self.claude_tab), "Claude")
         self.tabs.addTab(self._scrollable(self.codex_tab), "Codex")
         self.tabs.addTab(self._scrollable(self.gemini_tab), "Gemini")
+        while self.tabs.count() > 2:
+            self.tabs.removeTab(2)
+        self.tabs.setTabText(1, "계정 관리")
         outer.addWidget(self.tabs, 1)
 
         btns = QHBoxLayout()
@@ -573,9 +904,7 @@ class SettingsWindow(QWidget):
         # Wrap every step so silent exceptions surface in the log AND a dialog.
         try:
             self.general_tab.write_back()
-            self.claude_tab.write_back()
-            self.codex_tab.write_back()
-            self.gemini_tab.write_back()
+            self.accounts_tab.write_back()
         except Exception as e:  # noqa: BLE001
             log.exception("write_back failed")
             from ..logger import log_path
