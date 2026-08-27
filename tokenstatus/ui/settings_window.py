@@ -30,15 +30,16 @@ from PyQt6.QtGui import QGuiApplication
 
 from .. import autostart
 from ..config import AccountConfig, CLAUDE_PRESETS, GEMINI_PRESETS, Config, ProviderConfig
-from ..readers import read_claude
+from ..readers import detect_local_account, read_claude
 from ..readers.claude_api import (
     delete_session_key,
     discover_org,
+    fetch_account,
     fetch_usage,
     load_session_key,
     save_session_key,
 )
-from .style import ACCENT, GLOBAL_QSS, MUTED
+from .style import ACCENT, ACCENT_DARK, GLOBAL_QSS, MUTED
 
 
 def _style_combo_popup(combo: QComboBox) -> None:
@@ -548,6 +549,7 @@ class AccountsTab(QWidget):
     def __init__(self, cfg: Config) -> None:
         super().__init__()
         self.cfg = cfg
+        self._current_row = -1   # 행이 실제로 바뀔 때만 세션 키 입력칸을 비우기 위함
         self._build()
         self._refresh_list()
 
@@ -561,7 +563,8 @@ class AccountsTab(QWidget):
         self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.list.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.list.currentRowChanged.connect(self._load_selected)
-        left.addWidget(self.list, 1)
+        self.list.setMinimumHeight(220)
+        left.addWidget(self.list, 0)
 
         add_account = QPushButton("+  계정 추가")
         add_account.setObjectName("accountAdd")
@@ -570,10 +573,23 @@ class AccountsTab(QWidget):
         add_account.clicked.connect(self._choose_account_type)
         left.addWidget(add_account)
 
+        # 목록 순서 = 오버레이/상태창에 표시되는 순서.
+        move_row = QHBoxLayout()
+        self.move_up_btn = QPushButton("↑ 위로")
+        self.move_up_btn.setToolTip("표시 순서를 위로 (오버레이에서 더 먼저 나옵니다)")
+        self.move_up_btn.clicked.connect(lambda: self._move_selected(-1))
+        self.move_down_btn = QPushButton("↓ 아래로")
+        self.move_down_btn.setToolTip("표시 순서를 아래로")
+        self.move_down_btn.clicked.connect(lambda: self._move_selected(1))
+        move_row.addWidget(self.move_up_btn)
+        move_row.addWidget(self.move_down_btn)
+        left.addLayout(move_row)
+
         self.delete_btn = QPushButton("선택 삭제")
         self.delete_btn.clicked.connect(self._delete_selected)
         self.delete_btn.setMinimumWidth(210)
         left.addWidget(self.delete_btn)
+        left.addStretch(1)
         outer.addLayout(left, 1)
 
         form_wrap = QWidget()
@@ -592,8 +608,12 @@ class AccountsTab(QWidget):
         self.provider_info.setObjectName("subtitle")
         self.provider_info.setWordWrap(True)
         form.addRow("종류", self.kind)
-        self.log_dir = QLineEdit()
         form.addRow("", self.provider_info)
+        # 계정 연동이 이 탭의 핵심이므로 로그 폴더/한도보다 먼저 보이게 둔다.
+        self.use_api = QCheckBox("claude.ai 실시간 사용량 사용 (권장)")
+        self.link_box = self._build_link_box()
+        form.addRow(self.link_box)
+        self.log_dir = QLineEdit()
         browse = QPushButton("폴더 선택")
         browse.clicked.connect(self._browse)
         path_row = QHBoxLayout()
@@ -615,8 +635,6 @@ class AccountsTab(QWidget):
         self.message_limit.setRange(1, 1_000_000_000)
         self.message_limit.setGroupSeparatorShown(True)
         form.addRow("메시지 한도", self.message_limit)
-        self.use_api = QCheckBox("Claude API 사용")
-        form.addRow("", self.use_api)
         self.form = form
         outer.addWidget(form_wrap, 2)
         outer.setStretch(0, 0)
@@ -643,6 +661,271 @@ class AccountsTab(QWidget):
         self.use_api.toggled.connect(self._save_selected)
         self.use_api.toggled.connect(self._update_provider_fields)
 
+    # ---------- claude.ai 계정 연동 ----------
+
+    def _build_link_box(self) -> QGroupBox:
+        box = QGroupBox("🔗 claude.ai 계정 연동")
+        box.setStyleSheet(
+            f"QGroupBox {{ font-weight: 600; margin-top: 12px; padding-top: 12px; "
+            f"border: 1px solid {ACCENT}40; border-radius: 8px; }}"
+            f"QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 6px; color: {ACCENT}; }}"
+        )
+        v = QVBoxLayout(box)
+        v.setSpacing(7)
+
+        self.use_api.setMinimumHeight(24)
+        v.addWidget(self.use_api)
+
+        self.link_who = QLabel("")
+        self.link_who.setWordWrap(True)
+        v.addWidget(self.link_who)
+
+        hint = QLabel(
+            "계정마다 키가 따로 저장됩니다. claude.ai 로그인 → F12 → "
+            "Application → Cookies → sessionKey 복사."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
+        v.addWidget(hint)
+
+        key_row = QHBoxLayout()
+        self.session_key = QLineEdit()
+        self.session_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.session_key.setMinimumWidth(180)
+        self.session_key.returnPressed.connect(self._link_verify)
+        key_row.addWidget(QLabel("세션 키"))
+        key_row.addWidget(self.session_key, 1)
+        v.addLayout(key_row)
+
+        btn_row = QHBoxLayout()
+        self.link_verify_btn = QPushButton("계정 확인 / 연결")
+        self.link_verify_btn.setObjectName("primary")
+        self.link_verify_btn.setStyleSheet(
+            f"QPushButton {{ background: {ACCENT}; color: white; font-weight: 600; "
+            f"border: 1px solid {ACCENT_DARK}; border-radius: 8px; "
+            f"padding: 7px 14px; font-size: 13px; }}"
+            f"QPushButton:hover {{ background: {ACCENT_DARK}; border-color: {ACCENT_DARK}; }}"
+            f"QPushButton:pressed {{ background: #C2410C; }}"
+            f"QPushButton:disabled {{ background: #F1F5F9; color: #94A3B8; "
+            f"border-color: #CBD5E1; }}"
+        )
+        self.link_verify_btn.setMinimumWidth(140)
+        self.link_verify_btn.setMinimumHeight(34)
+        self.link_verify_btn.clicked.connect(self._link_verify)
+        self.link_clear_btn = QPushButton("연결 해제")
+        self.link_clear_btn.setMinimumWidth(110)
+        self.link_clear_btn.setMinimumHeight(34)
+        self.link_clear_btn.clicked.connect(self._link_clear)
+        btn_row.addWidget(self.link_verify_btn)
+        btn_row.addWidget(self.link_clear_btn)
+        btn_row.addStretch(1)
+        v.addLayout(btn_row)
+
+        org_row = QHBoxLayout()
+        self.org_box = QComboBox()
+        _style_combo_popup(self.org_box)
+        self.org_box.currentIndexChanged.connect(self._org_changed)
+        org_row.addWidget(QLabel("조직"))
+        org_row.addWidget(self.org_box, 1)
+        v.addLayout(org_row)
+
+        self.link_result = QLabel("")
+        self.link_result.setWordWrap(True)
+        self.link_result.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        v.addWidget(self.link_result)
+        return box
+
+    def _current_account(self) -> AccountConfig | None:
+        row = self.list.currentRow()
+        if row < 0 or row >= len(self.cfg.providers):
+            return None
+        return self.cfg.providers[row]
+
+    def _set_link_result(self, text: str, ok: bool = True) -> None:
+        self.link_result.setText(text)
+        color = ACCENT if ok else "#B91C1C"
+        self.link_result.setStyleSheet(f"color: {color}; font-size: 11px;")
+
+    def _refresh_link_box(self, account: AccountConfig) -> None:
+        """선택된 계정 기준으로 연동 상태 표시를 다시 그린다."""
+        pc = account.config
+        has_key = bool(load_session_key(account.id))
+        self.session_key.setPlaceholderText(
+            "(이 계정의 키가 저장돼 있음 — 바꾸려면 새 키 붙여넣기)"
+            if has_key else "sessionKey 값 붙여넣기"
+        )
+
+        if pc.account_email:
+            who = f"✓ 연결된 계정: <b>{pc.account_email}</b>"
+            if pc.org_name:
+                who += f" · {pc.org_name}"
+            self.link_who.setStyleSheet(f"color: {ACCENT}; font-size: 11px;")
+        elif has_key:
+            who = ("세션 키 저장됨 — [계정 확인] 을 누르면 어느 계정인지 표시됩니다."
+                   + (f" (조직 {pc.org_id[:8]}…)" if pc.org_id else ""))
+            self.link_who.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        else:
+            local = detect_local_account(pc.log_dir)
+            who = "미연동 — 로컬 로그 추정값으로 표시됩니다."
+            if local:
+                who += f" (로그 폴더 계정: {local})"
+            self.link_who.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        self.link_who.setText(who)
+
+        self.org_box.blockSignals(True)
+        self.org_box.clear()
+        if pc.org_id:
+            self.org_box.addItem(pc.org_name or pc.org_id[:8] + "…", pc.org_id)
+        else:
+            self.org_box.addItem("(계정 확인 후 선택)", "")
+        self.org_box.setCurrentIndex(0)
+        self.org_box.blockSignals(False)
+        self.org_box.setEnabled(bool(pc.org_id))
+
+        self._warn_duplicate(account)
+
+    def _warn_duplicate(self, account: AccountConfig) -> None:
+        """같은 계정을 두 번 등록했거나, 로컬 모드 두 항목이 같은 폴더를 보는 상황 경고.
+
+        로컬 JSONL 에는 계정 식별자가 없어서 log_dir 이 같으면 두 항목은 반드시
+        같은 숫자를 보여준다 — "다른 계정을 보고 있다" 는 착각의 원인이라 짚어준다.
+        """
+        if account.kind != "claude":
+            self.link_result.setText("")
+            return
+        pc = account.config
+        for other in self.cfg.providers:
+            if other is account or other.kind != "claude":
+                continue
+            opc = other.config
+            if pc.account_email and opc.account_email == pc.account_email and opc.org_id == pc.org_id:
+                self._set_link_result(
+                    f"⚠ '{other.label}' 도 같은 계정·조직에 연결돼 있습니다. 값이 똑같이 나옵니다.",
+                    False)
+                return
+            if (not pc.use_api and not opc.use_api
+                    and pc.log_dir and opc.log_dir.lower() == pc.log_dir.lower()):
+                self._set_link_result(
+                    f"⚠ '{other.label}' 와 로그 폴더가 같습니다. 로컬 로그에는 계정 구분이 없어 "
+                    f"두 항목이 항상 같은 값을 표시합니다. 계정을 나누려면 각각 세션 키를 등록하세요.",
+                    False)
+                return
+        claude_count = sum(1 for a in self.cfg.providers if a.kind == "claude")
+        if not pc.use_api and claude_count > 1:
+            self._set_link_result(
+                "ℹ 로컬 로그에는 계정 정보가 없어 이 항목은 계정을 구분하지 못합니다. "
+                "세션 키를 등록하면 해당 계정의 실제 사용량이 표시됩니다.")
+            return
+        self.link_result.setText("")
+
+    def _link_verify(self) -> None:
+        from PyQt6.QtWidgets import QApplication
+
+        account = self._current_account()
+        if account is None:
+            return
+        pc = account.config
+
+        typed = self.session_key.text().strip()
+        if typed:
+            save_session_key(typed, account.id)
+            self.session_key.clear()
+        key = load_session_key(account.id)
+        if not key:
+            self._set_link_result("⚠ 세션 키가 비어 있습니다. 위에 붙여넣고 다시 누르세요.", False)
+            return
+
+        self._set_link_result("⏳ 계정 확인 중...")
+        QApplication.processEvents()
+
+        info, err = fetch_account(key)
+        if info is None:
+            self._set_link_result(f"✗ {err}", False)
+            return
+
+        usable = [o for o in info.orgs if o.usable]
+        if not usable:
+            self._set_link_result("✗ 사용량을 조회할 수 있는 조직이 없습니다 (API 전용 계정).", False)
+            return
+
+        pc.account_email = info.email
+        if pc.org_id not in [o.uuid for o in usable]:
+            pc.org_id = usable[0].uuid
+        pc.org_name = next(o.name for o in usable if o.uuid == pc.org_id)
+        pc.use_api = True
+        self.use_api.blockSignals(True)
+        self.use_api.setChecked(True)
+        self.use_api.blockSignals(False)
+
+        self.org_box.blockSignals(True)
+        self.org_box.clear()
+        for o in usable:
+            self.org_box.addItem(o.name or o.uuid[:8] + "…", o.uuid)
+        self.org_box.setCurrentIndex([o.uuid for o in usable].index(pc.org_id))
+        self.org_box.blockSignals(False)
+        self.org_box.setEnabled(True)
+
+        if self._is_default_label(account):
+            account.label = info.email.split("@")[0] or account.label
+            self.label.blockSignals(True)
+            self.label.setText(account.label)
+            self.label.blockSignals(False)
+
+        usage, uerr = fetch_usage(key, pc.org_id)
+        if usage is None:
+            self._set_link_result(f"계정은 확인됐지만 사용량 조회 실패: {uerr}", False)
+        else:
+            self._set_link_result(
+                f"✓ {info.email} 연결됨 — 5h {usage.five_hour_pct:.1f}% · "
+                f"주간 {usage.seven_day_pct:.1f}%")
+
+        self.link_who.setText(f"✓ 연결된 계정: <b>{pc.account_email}</b> · {pc.org_name}")
+        self.link_who.setStyleSheet(f"color: {ACCENT}; font-size: 11px;")
+        self.session_key.setPlaceholderText("(이 계정의 키가 저장돼 있음 — 바꾸려면 새 키 붙여넣기)")
+        self._update_provider_fields()
+        row = self.list.currentRow()
+        self._refresh_list_keep_row(row)
+
+    def _is_default_label(self, account: AccountConfig) -> bool:
+        """사용자가 직접 지은 이름은 덮어쓰지 않는다."""
+        base = {"claude": "Claude", "codex": "Codex", "gemini": "Gemini"}[account.kind]
+        label = (account.label or "").strip()
+        if not label or label == base:
+            return True
+        return label.startswith(base + " ") and label[len(base) + 1:].strip().isdigit()
+
+    def _org_changed(self, _index: int) -> None:
+        account = self._current_account()
+        if account is None:
+            return
+        uuid = self.org_box.currentData() or ""
+        if not uuid:
+            return
+        account.config.org_id = uuid
+        account.config.org_name = self.org_box.currentText()
+
+    def _link_clear(self) -> None:
+        account = self._current_account()
+        if account is None:
+            return
+        delete_session_key(account.id)
+        pc = account.config
+        pc.org_id = ""
+        pc.org_name = ""
+        pc.account_email = ""
+        pc.use_api = False
+        self.use_api.blockSignals(True)
+        self.use_api.setChecked(False)
+        self.use_api.blockSignals(False)
+        self.session_key.clear()
+        self._refresh_link_box(account)
+        self._set_link_result("이 계정의 세션 키와 조직 정보를 삭제했습니다.")
+        self._update_provider_fields()
+
+    def _refresh_list_keep_row(self, row: int) -> None:
+        self._refresh_list()
+        self.list.setCurrentRow(row)
+
     def _default_config(self, kind: str) -> ProviderConfig:
         if kind == "codex":
             return ProviderConfig(log_dir=str(Path.home() / ".codex" / "sessions"), token_limit=100)
@@ -667,6 +950,23 @@ class AccountsTab(QWidget):
         self._refresh_list()
         self.list.setCurrentRow(len(self.cfg.providers) - 1)
 
+    def _move_selected(self, delta: int) -> None:
+        """선택한 계정을 목록에서 한 칸 옮긴다. providers 순서가 곧 표시 순서다."""
+        row = self.list.currentRow()
+        new_row = row + delta
+        if row < 0 or not (0 <= new_row < len(self.cfg.providers)):
+            return
+        providers = self.cfg.providers
+        providers[row], providers[new_row] = providers[new_row], providers[row]
+        self._current_row = -1          # 행이 바뀌었으니 폼을 새로 읽게 한다
+        self._refresh_list()
+        self.list.setCurrentRow(new_row)
+
+    def _update_move_buttons(self, row: int) -> None:
+        last = len(self.cfg.providers) - 1
+        self.move_up_btn.setEnabled(0 < row <= last)
+        self.move_down_btn.setEnabled(0 <= row < last)
+
     def _delete_selected(self) -> None:
         row = self.list.currentRow()
         if row < 0 or row >= len(self.cfg.providers):
@@ -675,24 +975,38 @@ class AccountsTab(QWidget):
         self._refresh_list()
         self.list.setCurrentRow(min(row, len(self.cfg.providers) - 1))
 
+    @staticmethod
+    def _list_text(account: AccountConfig) -> str:
+        state = "" if account.enabled else " (꺼짐)"
+        who = account.config.account_email or account.kind
+        return f"{account.label or account.kind.title()} · {who}{state}"
+
     def _refresh_list(self) -> None:
         self.list.blockSignals(True)
         self.list.clear()
         for account in self.cfg.providers:
-            state = "" if account.enabled else " (꺼짐)"
-            self.list.addItem(f"{account.label or account.kind.title()} · {account.kind}{state}")
+            self.list.addItem(self._list_text(account))
         self.list.blockSignals(False)
-        self._load_selected(self.list.currentRow())
+        if self.list.currentRow() >= 0:
+            self._load_selected(self.list.currentRow())
 
     def _load_selected(self, row: int) -> None:
         enabled = 0 <= row < len(self.cfg.providers)
         for widget in (
             self.enabled, self.label, self.kind, self.log_dir, self.window_min,
             self.token_limit, self.message_limit, self.use_api, self.delete_btn,
+            self.session_key, self.link_verify_btn, self.link_clear_btn,
         ):
             widget.setEnabled(enabled)
+        self._update_move_buttons(row)
         if not enabled:
+            self._current_row = -1
             return
+        if row != self._current_row:
+            # 다른 계정으로 넘어갈 때만 입력 중이던 키를 버린다 (이름 수정 중엔 유지).
+            self.session_key.clear()
+            self.link_result.setText("")
+            self._current_row = row
         account = self.cfg.providers[row]
         pc = account.config
         self.enabled.blockSignals(True)
@@ -719,23 +1033,24 @@ class AccountsTab(QWidget):
         self.token_limit.blockSignals(False)
         self.message_limit.blockSignals(False)
         self.use_api.blockSignals(False)
+        self._refresh_link_box(account)
         self._update_provider_fields()
 
     def _update_provider_fields(self, *_args) -> None:
         kind = self.kind.currentData() or "claude"
         descriptions = {
             "claude": (
-                "공식 API 사용 시 Claude가 보고한 사용량을 표시합니다. "
-                "끄면 로컬 로그와 토큰 한도로 추정합니다."
+                "claude.ai 계정을 연결하면 그 계정의 실제 사용량을 표시합니다. "
+                "연결하지 않으면 로그 폴더 기준 추정값이며, 계정 구분이 되지 않습니다."
             ),
             "codex": "Codex 세션 로그가 보고한 사용률과 초기화 시간을 그대로 표시합니다.",
             "gemini": "로컬 기록의 메시지 수를 설정한 한도와 비교한 추정값입니다.",
         }
         self.provider_info.setText(descriptions[kind])
+        self.link_box.setVisible(kind == "claude")
         for widget, visible in (
             (self.token_limit, kind == "claude" and not self.use_api.isChecked()),
             (self.message_limit, kind == "gemini"),
-            (self.use_api, kind == "claude"),
         ):
             widget.setVisible(visible)
             label = self.form.labelForField(widget)
@@ -756,9 +1071,11 @@ class AccountsTab(QWidget):
         pc.token_limit = int(self.token_limit.value())
         pc.message_limit = int(self.message_limit.value())
         pc.use_api = self.use_api.isChecked()
-        current = self.list.currentRow()
-        self._refresh_list()
-        self.list.setCurrentRow(current)
+        # 목록 전체를 다시 만들면 QLineEdit 이 잠깐 비활성화되며 포커스를 잃는다.
+        # (표시 이름을 한 글자 치면 입력이 끊기던 원인) 해당 줄만 갱신한다.
+        item = self.list.item(row)
+        if item is not None:
+            item.setText(self._list_text(account))
 
     def _browse(self) -> None:
         start = self.log_dir.text() or str(Path.home())
@@ -776,16 +1093,18 @@ class SettingsWindow(QWidget):
         cfg: Config,
         on_save: Callable[[], None],
         on_reset_overlay: Callable[[], None] | None = None,
+        on_restart: Callable[[], None] | None = None,
     ) -> None:
         super().__init__()
         self.cfg = cfg
         self._on_save = on_save
         self._on_reset_overlay = on_reset_overlay
+        self._on_restart = on_restart
         self.setWindowTitle("Token Status — 설정")
         self.setObjectName("root")
         self.setStyleSheet(GLOBAL_QSS)
-        self.setMinimumSize(720, 500)
-        self.resize(820, 580)
+        self.setMinimumSize(720, 520)
+        self.resize(900, 700)
         self._build()
 
     def _build(self) -> None:
@@ -835,12 +1154,17 @@ class SettingsWindow(QWidget):
         log_btn = QPushButton("로그 보기")
         log_btn.setToolTip("문제 발생 시 자세한 오류 기록을 텍스트 에디터로 엽니다")
         log_btn.clicked.connect(self._open_log)
+        self.restart_btn = QPushButton("저장 후 재시작")
+        self.restart_btn.setToolTip("설정을 저장하고 앱을 다시 실행합니다 (코드 수정 반영용)")
+        self.restart_btn.clicked.connect(self._save_and_restart)
+        self.restart_btn.setVisible(self._on_restart is not None)
         cancel = QPushButton("취소")
         cancel.clicked.connect(self.close)
         save = QPushButton("저장")
         save.setObjectName("primary")
         save.clicked.connect(self._save)
         btns.addWidget(log_btn)
+        btns.addWidget(self.restart_btn)
         btns.addStretch(1)
         btns.addWidget(cancel)
         btns.addWidget(save)
@@ -860,7 +1184,7 @@ class SettingsWindow(QWidget):
         area = QScrollArea()
         area.setWidgetResizable(True)
         area.setFrameShape(QFrame.Shape.NoFrame)
-        area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         area.setStyleSheet("QScrollArea { background: transparent; border: none; }")
         area.viewport().setStyleSheet("background: transparent;")
         inner.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, False)
@@ -881,6 +1205,16 @@ class SettingsWindow(QWidget):
         y = avail.top() + (avail.height() - self.height()) // 2
         self.move(x, y)
 
+    def _save_and_restart(self) -> None:
+        if self._on_restart is None:
+            return
+        if not self._save():
+            return                      # 저장 실패 시엔 재시작하지 않는다
+        try:
+            self._on_restart()
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "재시작 실패", str(e))
+
     def _open_log(self) -> None:
         import os, subprocess, sys
         from ..logger import log_path
@@ -898,7 +1232,7 @@ class SettingsWindow(QWidget):
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, "로그 열기 실패", str(e))
 
-    def _save(self) -> None:
+    def _save(self) -> bool:
         import logging, traceback
         log = logging.getLogger(__name__)
         # Wrap every step so silent exceptions surface in the log AND a dialog.
@@ -912,13 +1246,13 @@ class SettingsWindow(QWidget):
                 self, "저장 실패",
                 f"설정 위젯 값 수집 중 오류:\n{e}\n\n로그: {log_path()}"
             )
-            return
+            return False
         try:
             self.cfg.save()
         except OSError as e:
             log.exception("config save failed")
             QMessageBox.critical(self, "저장 실패", f"설정 파일 저장 중 오류: {e}")
-            return
+            return False
         try:
             autostart.apply(self.cfg.autostart)
         except OSError as e:
@@ -934,3 +1268,4 @@ class SettingsWindow(QWidget):
             )
         log.info("settings saved successfully")
         self.close()
+        return True

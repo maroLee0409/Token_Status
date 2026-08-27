@@ -37,6 +37,9 @@ class ProviderConfig:
     # claude.ai web API ("official" mode) — Claude only, ignored elsewhere.
     use_api: bool = False
     org_id: str = ""
+    # 이 계정이 실제로 어느 claude.ai 계정인지 (표시 전용 — 세션 키는 keyring 에만 저장).
+    account_email: str = ""
+    org_name: str = ""
 
 
 @dataclass
@@ -79,7 +82,7 @@ DISPLAY_MODES = ("standard", "compact", "minimal", "overlay")
 
 @dataclass
 class Config:
-    schema_version: int = 2
+    schema_version: int = 3
     refresh_seconds: int = 30
     autostart: bool = False
     show_window_on_click: bool = True
@@ -159,7 +162,8 @@ class Config:
                     enabled=bool(item.get("enabled", True)),
                     config=pc,
                 ))
-        if int(raw.get("schema_version", 1)) < 2:
+        raw_version = int(raw.get("schema_version", 1))
+        if raw_version < 2:
             migrated: list[AccountConfig] = []
             for kind in ("claude", "codex", "gemini"):
                 pc = getattr(cfg, kind)
@@ -173,8 +177,22 @@ class Config:
             migrated.extend(cfg.providers)
             cfg.providers = migrated
             cfg.overlay_visible_ids = []
-        cfg.schema_version = 2
+        if raw_version < 3:
+            cfg._migrate_session_key()
+        cfg.schema_version = 3
         return cfg
+
+    def _migrate_session_key(self) -> None:
+        """v2 까지는 세션 키가 keyring 전역 슬롯 1개였다. API 를 쓰는 첫 Claude
+        계정으로 옮겨서, 계정별 키 체계에서도 기존 설정이 그대로 동작하게 한다."""
+        from .readers.claude_api import migrate_legacy_session_key
+
+        target = next(
+            (a for a in self.providers if a.kind == "claude" and a.config.use_api), None)
+        if target is None:
+            target = next((a for a in self.providers if a.kind == "claude"), None)
+        if target is not None:
+            migrate_legacy_session_key(target.id)
 
     def save(self) -> None:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)

@@ -1,8 +1,10 @@
 """claude.ai web API client — fetches the exact usage % shown on claude.ai.
 
-Auth: a single sessionKey cookie copied from the user's logged-in browser.
-The key is stored in Windows Credential Manager via the `keyring` library
-(never in plain config.json).
+Auth: sessionKey 쿠키를 브라우저에서 복사해 쓴다. 계정마다 별도 슬롯
+(`claude_session_key::<account_id>`)으로 Windows 자격 증명 관리자 / macOS 키체인에
+저장한다 (config.json 에는 절대 남기지 않음).
+
+  GET /api/account -> {"email_address": "...", "memberships": [{"organization": {...}}]}
 
 Endpoint shape (cross-verified from ClaudeMeter + lugia19's Claude-Usage-Extension):
   GET /api/organizations                            -> [{"uuid": "...", "name": "..."}]
@@ -32,6 +34,7 @@ except ImportError:  # pragma: no cover
 
 
 KEYRING_SERVICE = "TokenStatus"
+# 레거시(계정 개념 도입 이전) 전역 슬롯. 마이그레이션 원본으로만 남겨둔다.
 KEYRING_USERNAME = "claude_session_key"
 
 _BASE = "https://claude.ai"
@@ -65,34 +68,67 @@ class ApiUsage:
     org_name: str = ""
 
 
+@dataclass
+class OrgInfo:
+    uuid: str
+    name: str
+    usable: bool = True   # 사용량 조회가 가능한 조직인지 (chat capability 보유)
+
+
+@dataclass
+class AccountInfo:
+    email: str
+    full_name: str
+    orgs: list
+
+
 # ---------- keyring storage ----------
 
-def save_session_key(value: str) -> bool:
+def _slot(account_id: str) -> str:
+    """계정별 keyring 사용자명. account_id 가 비면 레거시 전역 슬롯."""
+    account_id = (account_id or "").strip()
+    return f"{KEYRING_USERNAME}::{account_id}" if account_id else KEYRING_USERNAME
+
+
+def save_session_key(value: str, account_id: str = "") -> bool:
     if not keyring:
         return False
     try:
-        keyring.set_password(KEYRING_SERVICE, KEYRING_USERNAME, value or "")
+        keyring.set_password(KEYRING_SERVICE, _slot(account_id), value or "")
         return True
     except Exception:
         return False
 
 
-def load_session_key() -> str:
+def load_session_key(account_id: str = "") -> str:
+    """계정 전용 키를 반환. 폴백 없음 — 계정마다 반드시 자기 키를 써야 한다."""
     if not keyring:
         return ""
     try:
-        return keyring.get_password(KEYRING_SERVICE, KEYRING_USERNAME) or ""
+        return keyring.get_password(KEYRING_SERVICE, _slot(account_id)) or ""
     except Exception:
         return ""
 
 
-def delete_session_key() -> None:
+def delete_session_key(account_id: str = "") -> None:
     if not keyring:
         return
     try:
-        keyring.delete_password(KEYRING_SERVICE, KEYRING_USERNAME)
+        keyring.delete_password(KEYRING_SERVICE, _slot(account_id))
     except Exception:
         pass
+
+
+def migrate_legacy_session_key(account_id: str) -> bool:
+    """레거시 전역 키를 지정 계정 슬롯으로 1회 이관. 옮겼으면 True."""
+    if not keyring or not account_id:
+        return False
+    if load_session_key(account_id):
+        return False           # 이미 자기 키가 있으면 건드리지 않는다
+    legacy = load_session_key("")
+    if not legacy:
+        return False
+    return save_session_key(legacy, account_id)
 
 
 # ---------- HTTP ----------
@@ -114,6 +150,54 @@ def _make_session(session_key: str):
     s.cookies.set("sessionKey", session_key, domain="claude.ai")
     s.headers.update(_HEADERS)
     return s
+
+
+def fetch_account(session_key: str) -> tuple[Optional[AccountInfo], str]:
+    """세션 키의 주인(이메일)과 소속 조직 목록을 반환. (None, 오류메시지) on failure.
+
+    /api/organizations 는 이메일을 주지 않아 어떤 계정 키인지 구분이 안 된다.
+    /api/account 는 email_address + memberships 를 한 번에 주므로 계정 선택 UI의 기준으로 쓴다.
+    """
+    try:
+        s = _make_session(session_key)
+        r = s.get(f"{_BASE}/api/account", timeout=10)
+    except RuntimeError as e:
+        return None, str(e)
+    except Exception as e:  # noqa: BLE001
+        return None, f"네트워크 오류: {e}"
+
+    if r.status_code == 401:
+        return None, "세션 키가 만료/잘못됨 (401). claude.ai 에서 다시 복사해 오세요."
+    if r.status_code == 403:
+        return None, "Cloudflare 차단 (403). 잠시 후 재시도하세요."
+    if r.status_code != 200:
+        return None, f"HTTP {r.status_code}: {r.text[:120]}"
+
+    try:
+        d = r.json()
+    except ValueError:
+        return None, "응답이 JSON이 아닙니다 (로그인 페이지 가능성)."
+
+    orgs: list[OrgInfo] = []
+    for m in d.get("memberships") or []:
+        org = m.get("organization") if isinstance(m, dict) else None
+        if not isinstance(org, dict) or not org.get("uuid"):
+            continue
+        caps = org.get("capabilities") or []
+        # api_individual 전용 조직은 usage 엔드포인트가 403 을 준다. chat 보유 조직만 유효.
+        orgs.append(OrgInfo(
+            uuid=str(org["uuid"]),
+            name=str(org.get("name") or ""),
+            usable="chat" in caps,
+        ))
+    if not orgs:
+        return None, "소속 조직이 없습니다."
+
+    return AccountInfo(
+        email=str(d.get("email_address") or ""),
+        full_name=str(d.get("full_name") or ""),
+        orgs=orgs,
+    ), ""
 
 
 def discover_org(session_key: str) -> tuple[Optional[str], str]:
@@ -140,7 +224,8 @@ def discover_org(session_key: str) -> tuple[Optional[str], str]:
 
     if not isinstance(data, list) or not data:
         return None, "조직이 발견되지 않았습니다."
-    org = data[0]
+    # 사용량 조회가 가능한(chat) 조직 우선. api 전용 조직을 고르면 403 이 난다.
+    org = next((o for o in data if "chat" in (o.get("capabilities") or [])), data[0])
     return org.get("uuid"), org.get("name", "")
 
 

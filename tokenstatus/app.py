@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import sys
+import time
+from pathlib import Path
 
 from PyQt6.QtCore import QObject, QSharedMemory, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QIcon, QPalette, QPixmap
@@ -27,7 +29,13 @@ class _Bridge(QObject):
 
 
 class TokenStatusApp:
+    RESTART_FLAG = "--restarted"
+
     def __init__(self, argv: list[str]) -> None:
+        argv = list(argv)
+        restarted = self.RESTART_FLAG in argv
+        if restarted:
+            argv.remove(self.RESTART_FLAG)
         log_file = setup_logging()
         log.info("=== TokenStatus starting ===")
         log.info(f"log file: {log_file}")
@@ -55,9 +63,13 @@ class TokenStatusApp:
         # Single-instance guard. If the named segment already exists, another
         # instance is running; bail out cleanly.
         self._lock = QSharedMemory("TokenStatus_SingleInstance_v1")
-        if not self._lock.create(1):
-            self._already_running = True
-            return
+        # 재시작으로 뜬 경우엔 이전 프로세스가 완전히 내려갈 때까지 잠깐 기다린다.
+        deadline = time.time() + (5.0 if restarted else 0.0)
+        while not self._lock.create(1):
+            if time.time() >= deadline:
+                self._already_running = True
+                return
+            time.sleep(0.2)
         self._already_running = False
 
         self.cfg = Config.load()
@@ -122,6 +134,11 @@ class TokenStatusApp:
         self.action_settings.triggered.connect(self._show_settings)
         menu.addAction(self.action_settings)
 
+        self.action_restart = QAction("재시작")
+        self.action_restart.setToolTip("설정을 저장하고 앱을 다시 실행합니다 (코드 수정 반영용)")
+        self.action_restart.triggered.connect(self._restart_from_menu)
+        menu.addAction(self.action_restart)
+
         menu.addSeparator()
         self.action_quit = QAction("종료")
         self.action_quit.triggered.connect(self._quit)
@@ -163,6 +180,7 @@ class TokenStatusApp:
             self.cfg,
             on_save=self._on_settings_saved,
             on_reset_overlay=self._reset_overlay_pos,
+            on_restart=self._restart,
         )
         self.settings_window.show()
 
@@ -325,6 +343,47 @@ class TokenStatusApp:
         self.monitor.stop()
         self.tray.hide()
         self.qt.quit()
+
+    def _restart_from_menu(self) -> None:
+        """트레이 메뉴에서의 재시작 — 현재 설정을 먼저 저장하고 다시 띄운다."""
+        try:
+            self.cfg.save()
+        except OSError:
+            log.exception("restart: config save failed")
+        try:
+            self._restart()
+        except Exception as e:  # noqa: BLE001
+            log.exception("restart failed")
+            QMessageBox.critical(None, "재시작 실패", str(e))
+
+    def _restart(self) -> None:
+        """현재 프로세스를 새로 띄우고 자신은 종료한다.
+
+        소스를 고친 뒤 트레이에서 바로 반영하려고 쓴다. pythonw.exe 로 떠 있으면
+        같은 인터프리터로, 빌드된 exe 면 그 exe 로 다시 실행한다.
+        """
+        import subprocess
+
+        # 자식이 단일 인스턴스 가드에 막히지 않도록 우리 쪽 세그먼트를 먼저 놓아준다.
+        self._lock.detach()
+
+        if getattr(sys, "frozen", False):
+            cmd = [sys.executable] + sys.argv[1:]
+        else:
+            launcher = Path(__file__).resolve().parent.parent / "launcher.py"
+            cmd = ([sys.executable, str(launcher)] if launcher.is_file()
+                   else [sys.executable, "-m", "tokenstatus"]) + sys.argv[1:]
+        if self.RESTART_FLAG not in cmd:
+            cmd.append(self.RESTART_FLAG)
+
+        flags = 0
+        if sys.platform.startswith("win"):
+            # 부모가 죽어도 살아남도록 새 프로세스 그룹으로 띄운다.
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0) | \
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        subprocess.Popen(cmd, cwd=str(Path(__file__).resolve().parent.parent),
+                         close_fds=True, creationflags=flags)
+        self._quit()
 
     # ---------- updates ----------
     def _on_snapshots(self, snapshots: dict) -> None:
