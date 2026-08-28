@@ -56,6 +56,26 @@ _HEADERS = {
 }
 
 
+def _explain_403(resp) -> str:
+    """403 의 실제 원인을 본문에서 읽어낸다.
+
+    Cloudflare 차단과 세션 키 무효는 조치가 완전히 다르다. 전자는 기다리면
+    되고, 후자는 키를 다시 등록해야 한다.
+    """
+    try:
+        err = (resp.json() or {}).get("error") or {}
+    except ValueError:
+        return "Cloudflare 차단 (403). 잠시 후 재시도하세요."
+    code = ((err.get("details") or {}).get("error_code") or "").lower()
+    if code == "account_session_invalid" or "invalid authorization" in \
+            str(err.get("message", "")).lower():
+        return ("세션 키가 무효합니다 (403). 브라우저에서 다른 계정으로 로그인하면 "
+                "기존 키가 만료됩니다 — 해당 계정으로 claude.ai 에 로그인한 뒤 "
+                "sessionKey 를 다시 등록하세요.")
+    msg = str(err.get("message") or "").strip()
+    return f"권한 오류 (403){': ' + msg[:80] if msg else ''}"
+
+
 @dataclass
 class ApiUsage:
     five_hour_pct: float
@@ -169,7 +189,7 @@ def fetch_account(session_key: str) -> tuple[Optional[AccountInfo], str]:
     if r.status_code == 401:
         return None, "세션 키가 만료/잘못됨 (401). claude.ai 에서 다시 복사해 오세요."
     if r.status_code == 403:
-        return None, "Cloudflare 차단 (403). 잠시 후 재시도하세요."
+        return None, _explain_403(r)
     if r.status_code != 200:
         return None, f"HTTP {r.status_code}: {r.text[:120]}"
 
@@ -213,7 +233,7 @@ def discover_org(session_key: str) -> tuple[Optional[str], str]:
     if r.status_code == 401:
         return None, "세션 키가 만료/잘못됨 (401). claude.ai 에서 다시 복사해 오세요."
     if r.status_code == 403:
-        return None, "Cloudflare 차단 (403). 잠시 후 재시도하거나 User-Agent 검토 필요."
+        return None, _explain_403(r)
     if r.status_code != 200:
         return None, f"HTTP {r.status_code}: {r.text[:120]}"
 
@@ -249,7 +269,7 @@ def fetch_usage(session_key: str, org_id: str) -> tuple[Optional[ApiUsage], str]
     if r.status_code == 401:
         return None, "세션 키 만료 (401)"
     if r.status_code == 403:
-        return None, "Cloudflare 차단 (403)"
+        return None, _explain_403(r)
     if r.status_code == 404:
         return None, "조직 ID 잘못됨 (404). 자동 재검색하세요."
     if r.status_code != 200:
