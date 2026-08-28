@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QMessageBox,
     QPushButton,
+    QRadioButton,
     QScrollArea,
     QSpinBox,
     QTabWidget,
@@ -29,6 +30,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QGuiApplication
 
 from .. import autostart
+from .. import claude_profile
 from ..config import AccountConfig, CLAUDE_PRESETS, GEMINI_PRESETS, Config, ProviderConfig
 from ..readers import detect_local_account, read_claude
 from ..readers.claude_api import (
@@ -613,6 +615,8 @@ class AccountsTab(QWidget):
         self.use_api = QCheckBox("claude.ai 실시간 사용량 사용 (권장)")
         self.link_box = self._build_link_box()
         form.addRow(self.link_box)
+        self.profile_box = self._build_profile_box()
+        form.addRow(self.profile_box)
         self.log_dir = QLineEdit()
         browse = QPushButton("폴더 선택")
         browse.clicked.connect(self._browse)
@@ -660,6 +664,243 @@ class AccountsTab(QWidget):
         self.kind.currentIndexChanged.connect(self._update_provider_fields)
         self.use_api.toggled.connect(self._save_selected)
         self.use_api.toggled.connect(self._update_provider_fields)
+
+    # ---------- Claude Code 실행 프로필 ----------
+
+    def _build_profile_box(self) -> QGroupBox:
+        """계정별 CLAUDE_CONFIG_DIR 관리 + 실행 버튼.
+
+        인증은 공식 `claude auth login` 이 처리하고 이 앱은 토큰을 만지지 않는다.
+        기본 프로필(빈 경로)은 이미 로그인된 ~/.claude 를 그대로 쓴다.
+        """
+        box = QGroupBox("🚀 Claude Code 실행 프로필")
+        box.setStyleSheet(
+            f"QGroupBox {{ font-weight: 600; margin-top: 12px; padding-top: 12px; "
+            f"border: 1px solid {ACCENT}40; border-radius: 8px; }}"
+            f"QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 6px; color: {ACCENT}; }}"
+        )
+        v = QVBoxLayout(box)
+        v.setSpacing(7)
+
+        self.profile_default = QRadioButton("기본 프로필 — 지금 로그인돼 있는 계정 그대로 사용")
+        self.profile_default.setToolTip(
+            "CLAUDE_CONFIG_DIR 을 지정하지 않습니다. 로그인이 필요 없습니다.")
+        self.profile_custom = QRadioButton("전용 프로필 — 이 계정만의 폴더를 따로 둠")
+        self.profile_custom.setToolTip(
+            "최초 1회만 로그인하면 이후에는 버튼만으로 실행됩니다.")
+        for rb in (self.profile_default, self.profile_custom):
+            rb.setMinimumHeight(22)
+            v.addWidget(rb)
+        self.profile_default.toggled.connect(self._profile_mode_changed)
+
+        path_row = QHBoxLayout()
+        self.profile_path = QLabel("")
+        self.profile_path.setWordWrap(True)
+        self.profile_path.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
+        self.profile_open_btn = QPushButton("폴더 열기")
+        self.profile_open_btn.setMaximumWidth(90)
+        self.profile_open_btn.clicked.connect(self._profile_open_folder)
+        path_row.addWidget(self.profile_path, 1)
+        path_row.addWidget(self.profile_open_btn)
+        v.addLayout(path_row)
+
+        self.profile_who = QLabel("")
+        self.profile_who.setWordWrap(True)
+        v.addWidget(self.profile_who)
+
+        btn_row = QHBoxLayout()
+        self.profile_launch_btn = QPushButton("▶ 이 계정으로 실행")
+        self.profile_launch_btn.setStyleSheet(
+            f"QPushButton {{ background: {ACCENT}; color: white; font-weight: 600; "
+            f"border: 1px solid {ACCENT_DARK}; border-radius: 8px; "
+            f"padding: 7px 14px; font-size: 13px; }}"
+            f"QPushButton:hover {{ background: {ACCENT_DARK}; }}"
+            f"QPushButton:pressed {{ background: #C2410C; }}"
+            f"QPushButton:disabled {{ background: #F1F5F9; color: #94A3B8; border-color: #CBD5E1; }}"
+        )
+        self.profile_launch_btn.setMinimumHeight(34)
+        self.profile_launch_btn.setMinimumWidth(150)
+        self.profile_launch_btn.clicked.connect(self._profile_launch)
+        self.profile_login_btn = QPushButton("로그인")
+        self.profile_login_btn.setMinimumHeight(34)
+        self.profile_login_btn.setToolTip(
+            "새 콘솔 창에서 공식 OAuth 로그인을 시작합니다 (최초 1회)")
+        self.profile_login_btn.clicked.connect(self._profile_login)
+        self.profile_check_btn = QPushButton("상태 확인")
+        self.profile_check_btn.setMinimumHeight(34)
+        self.profile_check_btn.clicked.connect(self._profile_check)
+        btn_row.addWidget(self.profile_launch_btn)
+        btn_row.addWidget(self.profile_login_btn)
+        btn_row.addWidget(self.profile_check_btn)
+        btn_row.addStretch(1)
+        v.addLayout(btn_row)
+
+        self.profile_mismatch = QLabel("")
+        self.profile_mismatch.setWordWrap(True)
+        self.profile_mismatch.setVisible(False)
+        self.profile_mismatch.setStyleSheet("color: #B45309; font-size: 10px;")
+        v.addWidget(self.profile_mismatch)
+
+        self.profile_hint = QLabel(
+            "이 설정은 [이 계정으로 실행] 이 어느 계정으로 뜨는지만 정합니다. "
+            "표시되는 사용량 숫자는 위 🔗 계정 연동의 세션 키가 결정합니다 — 둘은 별개입니다."
+        )
+        self.profile_hint.setWordWrap(True)
+        self.profile_hint.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
+        v.addWidget(self.profile_hint)
+        return box
+
+    def _refresh_profile_mismatch(self, account: AccountConfig) -> None:
+        """실행 계정과 사용량 출처가 다르면, 숫자가 안 바뀌는 이유를 짚어준다."""
+        pc = account.config
+        run_as = (pc.profile_status or "").split(" · ")[0].strip()
+        msg = ""
+        if pc.use_api and not pc.account_email:
+            msg = ("⚠ 사용량 출처가 비어 있습니다 — 🔗 계정 연동에서 이 계정의 "
+                   "세션 키를 등록해야 숫자가 나옵니다.")
+        elif pc.use_api and run_as and pc.account_email and run_as != pc.account_email:
+            msg = (f"⚠ 실행 계정({run_as}) 과 사용량 출처({pc.account_email}) 가 다릅니다. "
+                   f"표시되는 숫자는 {pc.account_email} 것입니다 — 바꾸려면 🔗 계정 연동의 "
+                   f"세션 키를 {run_as} 것으로 교체하세요.")
+        elif (not pc.use_api
+                and not claude_profile.is_default(pc.claude_config_dir)
+                and not claude_profile.credentials_exist(pc.claude_config_dir)):
+            msg = ("⚠ 이 프로필은 아직 로그인 전이라 읽을 로그가 없습니다. "
+                   "[로그인] 을 한 번 눌러주세요.")
+        self.profile_mismatch.setText(msg)
+        self.profile_mismatch.setVisible(bool(msg))
+
+    def _set_profile_result(self, text: str, ok: bool = True) -> None:
+        self.profile_who.setText(text)
+        color = ACCENT if ok else "#B91C1C"
+        self.profile_who.setStyleSheet(f"color: {color}; font-size: 11px;")
+
+    def _refresh_profile_box(self, account: AccountConfig) -> None:
+        pc = account.config
+        custom = not claude_profile.is_default(pc.claude_config_dir)
+        self.profile_default.blockSignals(True)
+        self.profile_custom.blockSignals(True)
+        self.profile_custom.setChecked(custom)
+        self.profile_default.setChecked(not custom)
+        self.profile_default.blockSignals(False)
+        self.profile_custom.blockSignals(False)
+
+        if custom:
+            self.profile_path.setText(pc.claude_config_dir)
+        else:
+            self.profile_path.setText(str(Path.home() / ".claude") + "  (기본)")
+        self.profile_login_btn.setEnabled(custom)
+
+        logged_in = claude_profile.credentials_exist(pc.claude_config_dir)
+        if pc.profile_status:
+            self._set_profile_result("✓ " + pc.profile_status)
+        elif logged_in:
+            self._set_profile_result(
+                "로그인돼 있음 — [상태 확인] 을 누르면 어느 계정인지 표시됩니다.")
+            self.profile_who.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        else:
+            self._set_profile_result(
+                "아직 로그인하지 않은 프로필입니다. [로그인] 을 한 번만 눌러주세요.", False)
+        self.profile_launch_btn.setEnabled(logged_in or not custom)
+        self._refresh_profile_mismatch(account)
+
+    def _profile_mode_changed(self, _checked: bool = False) -> None:
+        account = self._current_account()
+        if account is None:
+            return
+        pc = account.config
+        if self.profile_custom.isChecked():
+            if claude_profile.is_default(pc.claude_config_dir):
+                # 폴더명은 만들 때 한 번만 정한다. 이후 표시 이름을 바꿔도 경로를
+                # 따라 바꾸면 이미 로그인해둔 폴더를 잃어버린다.
+                pc.claude_config_dir = str(
+                    claude_profile.unique_profile_path(account.label or account.id))
+        else:
+            pc.claude_config_dir = ""
+        pc.profile_status = ""
+        # 사용량 판독도 같은 프로필을 보도록 맞춰준다.
+        pc.log_dir = claude_profile.projects_dir(pc.claude_config_dir)
+        self.log_dir.blockSignals(True)
+        self.log_dir.setText(pc.log_dir)
+        self.log_dir.blockSignals(False)
+        self._refresh_profile_box(account)
+        self._warn_duplicate(account)
+
+    def _profile_open_folder(self) -> None:
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
+
+        account = self._current_account()
+        if account is None:
+            return
+        target = Path(account.config.claude_config_dir or (Path.home() / ".claude"))
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self._set_profile_result(f"✗ 폴더를 열 수 없습니다: {e}", False)
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+
+    def _profile_login(self) -> None:
+        account = self._current_account()
+        if account is None:
+            return
+        pc = account.config
+        if claude_profile.is_default(pc.claude_config_dir):
+            self._set_profile_result(
+                "기본 프로필은 이미 로그인돼 있어 로그인이 필요 없습니다.", False)
+            return
+        ok, err = claude_profile.login(pc.claude_config_dir)
+        if not ok:
+            self._set_profile_result(f"✗ {err}", False)
+            return
+        self._set_profile_result(
+            "새 콘솔 창에서 로그인을 진행하세요. 브라우저 승인이 끝나면 [상태 확인] 을 누르면 됩니다.")
+        self.profile_who.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+
+    def _profile_check(self) -> None:
+        from PyQt6.QtWidgets import QApplication
+
+        account = self._current_account()
+        if account is None:
+            return
+        pc = account.config
+        self._set_profile_result("⏳ 확인 중...")
+        self.profile_who.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
+        QApplication.processEvents()
+
+        data, err = claude_profile.auth_status(pc.claude_config_dir)
+        if data is None:
+            pc.profile_status = ""
+            self._set_profile_result(f"✗ {err}", False)
+            return
+        if not data.get("loggedIn"):
+            pc.profile_status = ""
+            self._set_profile_result(
+                "미로그인 — [로그인] 을 눌러 이 프로필에 계정을 연결하세요.", False)
+            self.profile_launch_btn.setEnabled(
+                claude_profile.is_default(pc.claude_config_dir))
+            return
+        pc.profile_status = claude_profile.describe_status(data)
+        self._set_profile_result("✓ " + pc.profile_status)
+        self.profile_launch_btn.setEnabled(True)
+        self._refresh_profile_mismatch(account)
+        if self._is_default_label(account) and data.get("email"):
+            account.label = str(data["email"]).split("@")[0] or account.label
+            self.label.blockSignals(True)
+            self.label.setText(account.label)
+            self.label.blockSignals(False)
+        self._refresh_list_keep_row(self.list.currentRow())
+
+    def _profile_launch(self) -> None:
+        account = self._current_account()
+        if account is None:
+            return
+        ok, err = claude_profile.launch(account.config.claude_config_dir)
+        if ok:
+            self._set_profile_result("▶ 새 창에서 Claude Code 를 실행했습니다.")
+        else:
+            self._set_profile_result(f"✗ {err}", False)
 
     # ---------- claude.ai 계정 연동 ----------
 
@@ -883,6 +1124,7 @@ class AccountsTab(QWidget):
         self.link_who.setStyleSheet(f"color: {ACCENT}; font-size: 11px;")
         self.session_key.setPlaceholderText("(이 계정의 키가 저장돼 있음 — 바꾸려면 새 키 붙여넣기)")
         self._update_provider_fields()
+        self._refresh_profile_mismatch(account)
         row = self.list.currentRow()
         self._refresh_list_keep_row(row)
 
@@ -996,6 +1238,8 @@ class AccountsTab(QWidget):
             self.enabled, self.label, self.kind, self.log_dir, self.window_min,
             self.token_limit, self.message_limit, self.use_api, self.delete_btn,
             self.session_key, self.link_verify_btn, self.link_clear_btn,
+            self.profile_default, self.profile_custom, self.profile_open_btn,
+            self.profile_launch_btn, self.profile_login_btn, self.profile_check_btn,
         ):
             widget.setEnabled(enabled)
         self._update_move_buttons(row)
@@ -1034,6 +1278,7 @@ class AccountsTab(QWidget):
         self.message_limit.blockSignals(False)
         self.use_api.blockSignals(False)
         self._refresh_link_box(account)
+        self._refresh_profile_box(account)
         self._update_provider_fields()
 
     def _update_provider_fields(self, *_args) -> None:
@@ -1048,6 +1293,7 @@ class AccountsTab(QWidget):
         }
         self.provider_info.setText(descriptions[kind])
         self.link_box.setVisible(kind == "claude")
+        self.profile_box.setVisible(kind == "claude")
         for widget, visible in (
             (self.token_limit, kind == "claude" and not self.use_api.isChecked()),
             (self.message_limit, kind == "gemini"),

@@ -40,6 +40,11 @@ class ProviderConfig:
     # 이 계정이 실제로 어느 claude.ai 계정인지 (표시 전용 — 세션 키는 keyring 에만 저장).
     account_email: str = ""
     org_name: str = ""
+    # 이 계정으로 Claude Code 를 실행할 때 쓸 CLAUDE_CONFIG_DIR.
+    # 빈 값 = 기본 프로필(~/.claude) — 이미 로그인된 계정을 그대로 사용한다.
+    claude_config_dir: str = ""
+    # 프로필 로그인 확인 결과를 캐시한 표시용 문자열 (예: "a@b.com · Org · max").
+    profile_status: str = ""
 
 
 @dataclass
@@ -82,7 +87,7 @@ DISPLAY_MODES = ("standard", "compact", "minimal", "overlay")
 
 @dataclass
 class Config:
-    schema_version: int = 3
+    schema_version: int = 4
     refresh_seconds: int = 30
     autostart: bool = False
     show_window_on_click: bool = True
@@ -179,7 +184,7 @@ class Config:
             cfg.overlay_visible_ids = []
         if raw_version < 3:
             cfg._migrate_session_key()
-        cfg.schema_version = 3
+        cfg.schema_version = 4
         return cfg
 
     def _migrate_session_key(self) -> None:
