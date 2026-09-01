@@ -51,6 +51,10 @@ def _bar_gradient(percent: float, rect: QRect) -> QLinearGradient:
 class OverlayWindow(QWidget):
     # Edge-grab thickness in pixels for resize handles around the borderless window.
     _RESIZE_MARGIN = 6
+    # % 자리에 사용률과 초기화 시각을 번갈아 보여 준다 (초 단위).
+    _PHASE_PCT_SEC = 4.0
+    _PHASE_RESET_SEC = 3.0
+
     def __init__(
         self,
         *,
@@ -92,7 +96,7 @@ class OverlayWindow(QWidget):
         self.setMinimumSize(140, 50)
 
         self.resize(max(width, 140), max(height, 50))
-        # 행에 표시되는 "N분 남음" 이 멈춰 보이지 않도록 매초 다시 그린다.
+        # 매초 다시 그린다: 남은 시간이 흘러가고, %/초기화 시각 전환도 여기서 일어난다.
         self._repaint_timer = QTimer(self)
         self._repaint_timer.setInterval(1000)
         self._repaint_timer.timeout.connect(self.update)
@@ -101,7 +105,7 @@ class OverlayWindow(QWidget):
     # ---------- public API ----------
     def set_snapshots(self, snapshots: dict[str, ProviderSnapshot]) -> None:
         self._snapshots = snapshots
-        # 초기화 시각을 각 행에 상시 표시하므로 별도 안내 버블은 띄우지 않는다.
+        # 초기화 시각은 % 자리에 번갈아 나오므로 별도 안내 버블은 띄우지 않는다.
         self.update()
 
     def set_visible_provider_ids(self, visible_provider_ids: set[str]) -> None:
@@ -218,10 +222,10 @@ class OverlayWindow(QWidget):
         # Column widths as proportion of window width.
         name_w = max(50, int(self.width() * 0.28))
         pct_w = max(40, int(self.width() * 0.20))
-        # 초기화 시각을 % 오른쪽에 상시 표시한다. 게이지가 최소 90px 는 남도록
-        # "시각+남은시간" -> "시각" -> 생략 순으로 단계적으로 줄인다.
+        # 초기화 시각은 % 와 같은 칸에서 번갈아 나온다. 칸 너비는 두 문구 중
+        # 넓은 쪽에 맞춰 고정해, 전환될 때 게이지 길이가 출렁이지 않게 한다.
+        # 게이지가 최소 90px 는 남도록 "시각+남은시간" -> "시각" 순으로 줄인다.
         reset_texts: dict[str, str] = {}
-        reset_w = 0
         rm = QFontMetrics(reset_font)
         for long_form in (True, False):
             cand = {k: self._fmt_reset_short(sn, long_form) for k, sn in rows}
@@ -229,9 +233,11 @@ class OverlayWindow(QWidget):
             if not widths:
                 break
             need = max(widths) + 8
-            if self.width() - pad_h * 2 - name_w - pct_w - need - 12 >= 90:
-                reset_texts, reset_w = cand, need
+            if self.width() - pad_h * 2 - name_w - max(pct_w, need) - 12 >= 90:
+                reset_texts = cand
+                pct_w = max(pct_w, need)
                 break
+        show_reset = bool(reset_texts) and self._reset_phase()
 
         # Shrink font until every provider name fits in name_w.
         names_to_fit = [_NAMES.get(k, s.name) for k, s in rows] or ["Claude"]
@@ -247,7 +253,7 @@ class OverlayWindow(QWidget):
         # Bar height proportional to row, but with a sensible floor & ceiling.
         bar_h = max(5, min(int(row_h * 0.28), max(8, row_h - font_pt - 4)))
         bar_left = pad_h + name_w + 6
-        bar_right = self.width() - pad_h - pct_w - reset_w - 6
+        bar_right = self.width() - pad_h - pct_w - 6
 
         if not rows:
             p.setPen(QColor(200, 200, 220, 200))
@@ -284,24 +290,29 @@ class OverlayWindow(QWidget):
             p.drawRoundedRect(bar_rect, radius, radius)
 
             pct_rect = QRect(bar_right + 6, y, pct_w, row_h)
-            p.setFont(pct_font)
-            p.setPen(QColor(255, 255, 255, 248))
-            p.drawText(pct_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                       f"{pct:.0f}%")
-
-            if reset_w:
-                reset_rect = QRect(pct_rect.right() + 4, y, reset_w - 4, row_h)
+            reset_text = reset_texts.get(key, "") if show_reset else ""
+            if reset_text:
                 p.setFont(reset_font)
                 p.setPen(QColor(190, 198, 215, 235))
-                p.drawText(reset_rect,
-                           Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
-                           reset_texts.get(key, ""))
+                text = reset_text
+            else:
+                p.setFont(pct_font)
+                p.setPen(QColor(255, 255, 255, 248))
+                text = f"{pct:.0f}%"
+            p.drawText(pct_rect, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                       text)
 
             y += row_h
 
+    @classmethod
+    def _reset_phase(cls) -> bool:
+        """True 인 동안은 % 대신 초기화 시각을 보여 준다 (모든 행이 함께 전환)."""
+        period = cls._PHASE_PCT_SEC + cls._PHASE_RESET_SEC
+        return (time.time() % period) >= cls._PHASE_PCT_SEC
+
     @staticmethod
     def _fmt_reset_short(snap: ProviderSnapshot, long_form: bool) -> str:
-        """행 오른쪽에 붙일 짧은 초기화 문구. long_form 이면 남은 시간까지 붙인다."""
+        """% 자리에 번갈아 띄울 짧은 초기화 문구. long_form 이면 남은 시간까지 붙인다."""
         ts = snap.resets_at
         if not ts:
             return ""
