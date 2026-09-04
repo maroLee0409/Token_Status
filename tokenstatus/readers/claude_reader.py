@@ -8,6 +8,7 @@ from pathlib import Path
 
 from .base import ProviderSnapshot, cache_get, cache_put, cache_evict_missing
 from .claude_api import fetch_usage, load_session_key
+from .claude_oauth import fetch_oauth_usage
 
 
 def detect_local_account(log_dir: str) -> str:
@@ -132,7 +133,7 @@ def _compute_active_block(
     return None, 0.0, 0, cur_last
 
 
-def _snapshot_from_api(api_usage, account_email: str = "") -> ProviderSnapshot:
+def _snapshot_from_api(api_usage, account_email: str = "", source: str = "claude.ai API") -> ProviderSnapshot:
     snap = ProviderSnapshot(
         name="Claude Code",
         unit="%",
@@ -145,7 +146,7 @@ def _snapshot_from_api(api_usage, account_email: str = "") -> ProviderSnapshot:
     snap.resets_at = api_usage.five_hour_resets_at
     snap.secondary_percent = api_usage.seven_day_pct
     snap.secondary_label = "주간"
-    bits = [f"claude.ai API · {account_email}" if account_email else "claude.ai API 직접 호출"]
+    bits = [f"{source} · {account_email}" if account_email else source]
     if api_usage.seven_day_sonnet_pct is not None:
         bits.append(f"Sonnet 주간 {api_usage.seven_day_sonnet_pct:.1f}%")
     if api_usage.seven_day_opus_pct is not None:
@@ -156,19 +157,28 @@ def _snapshot_from_api(api_usage, account_email: str = "") -> ProviderSnapshot:
 
 def read_claude(log_dir: str, window_minutes: int, token_limit: int,
                 *, use_api: bool = False, org_id: str = "",
-                account_id: str = "", account_email: str = "") -> ProviderSnapshot:
-    # Try claude.ai API first (exact match). Fall back to local logs on any failure.
+                account_id: str = "", account_email: str = "",
+                claude_config_dir: str = "") -> ProviderSnapshot:
+    # Prefer the renewable OAuth credential already owned by this isolated
+    # Claude Code profile. The browser sessionKey is legacy fallback only.
     fallback_reason = ""
     if use_api:
+        usage, oauth_err = fetch_oauth_usage(claude_config_dir)
+        if usage is not None:
+            return _snapshot_from_api(
+                usage, account_email or detect_local_account(log_dir),
+                source="Claude Code OAuth",
+            )
         session_key = load_session_key(account_id)
         if session_key:
             usage, err = fetch_usage(session_key, org_id)
             if usage is not None:
-                return _snapshot_from_api(usage, account_email)
-            fallback_reason = f"API 실패({err}) → 로컬 로그"
+                return _snapshot_from_api(usage, account_email, source="claude.ai 세션(호환)")
+            fallback_reason = (
+                f"OAuth 실패({oauth_err}) · 웹 세션 실패({err}) → 로컬 로그"
+            )
         else:
-            # 계정별 키가 없으면 왜 로컬 값이 보이는지 알 수 없으므로 이유를 남긴다.
-            fallback_reason = "이 계정의 세션 키 미등록 → 로컬 로그"
+            fallback_reason = f"OAuth 실패({oauth_err}) → 로컬 로그"
 
     block_hours = max(1, window_minutes / 60.0)
     snap = ProviderSnapshot(

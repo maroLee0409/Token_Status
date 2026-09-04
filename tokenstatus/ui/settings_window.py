@@ -41,6 +41,7 @@ from ..readers.claude_api import (
     load_session_key,
     save_session_key,
 )
+from ..readers.claude_oauth import oauth_credentials_available
 from .style import ACCENT, ACCENT_DARK, GLOBAL_QSS, MUTED
 
 
@@ -612,7 +613,7 @@ class AccountsTab(QWidget):
         form.addRow("종류", self.kind)
         form.addRow("", self.provider_info)
         # 계정 연동이 이 탭의 핵심이므로 로그 폴더/한도보다 먼저 보이게 둔다.
-        self.use_api = QCheckBox("claude.ai 실시간 사용량 사용 (권장)")
+        self.use_api = QCheckBox("Claude OAuth 실시간 사용량 사용 (권장)")
         self.link_box = self._build_link_box()
         form.addRow(self.link_box)
         self.profile_box = self._build_profile_box()
@@ -682,9 +683,9 @@ class AccountsTab(QWidget):
         v = QVBoxLayout(box)
         v.setSpacing(7)
 
-        self.profile_default = QRadioButton("기본 프로필 — 지금 로그인돼 있는 계정 그대로 사용")
+        self.profile_default = QRadioButton("기본 프로필 — Claude 계정 하나만 사용할 때")
         self.profile_default.setToolTip(
-            "CLAUDE_CONFIG_DIR 을 지정하지 않습니다. 로그인이 필요 없습니다.")
+            "공용 ~/.claude를 사용합니다. 여러 계정이 같은 기본 프로필을 공유할 수 없습니다.")
         self.profile_custom = QRadioButton("전용 프로필 — 이 계정만의 폴더를 따로 둠")
         self.profile_custom.setToolTip(
             "최초 1회만 로그인하면 이후에는 버튼만으로 실행됩니다.")
@@ -742,8 +743,8 @@ class AccountsTab(QWidget):
         v.addWidget(self.profile_mismatch)
 
         self.profile_hint = QLabel(
-            "이 설정은 [이 계정으로 실행] 이 어느 계정으로 뜨는지만 정합니다. "
-            "표시되는 사용량 숫자는 위 🔗 계정 연동의 세션 키가 결정합니다 — 둘은 별개입니다."
+            "실행과 사용량 조회가 모두 이 프로필의 Claude OAuth를 사용합니다. "
+            "여러 계정은 반드시 서로 다른 전용 프로필로 분리하세요."
         )
         self.profile_hint.setWordWrap(True)
         self.profile_hint.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
@@ -755,13 +756,13 @@ class AccountsTab(QWidget):
         pc = account.config
         run_as = (pc.profile_status or "").split(" · ")[0].strip()
         msg = ""
-        if pc.use_api and not pc.account_email:
-            msg = ("⚠ 사용량 출처가 비어 있습니다 — 🔗 계정 연동에서 이 계정의 "
-                   "세션 키를 등록해야 숫자가 나옵니다.")
+        has_oauth = oauth_credentials_available(pc.claude_config_dir)
+        if pc.use_api and not has_oauth and not load_session_key(account.id):
+            msg = ("⚠ 이 실행 프로필에 OAuth 로그인이 없습니다. [로그인]을 누르면 "
+                   "사용량도 자동 연결됩니다.")
         elif pc.use_api and run_as and pc.account_email and run_as != pc.account_email:
             msg = (f"⚠ 실행 계정({run_as}) 과 사용량 출처({pc.account_email}) 가 다릅니다. "
-                   f"표시되는 숫자는 {pc.account_email} 것입니다 — 바꾸려면 🔗 계정 연동의 "
-                   f"세션 키를 {run_as} 것으로 교체하세요.")
+                   "전용 프로필에 올바른 계정으로 다시 로그인하세요.")
         elif (not pc.use_api
                 and not claude_profile.is_default(pc.claude_config_dir)
                 and not claude_profile.credentials_exist(pc.claude_config_dir)):
@@ -816,6 +817,23 @@ class AccountsTab(QWidget):
                 pc.claude_config_dir = str(
                     claude_profile.unique_profile_path(account.label or account.id))
         else:
+            duplicate = next(
+                (a for a in self.cfg.providers
+                 if a is not account and a.kind == "claude"
+                 and claude_profile.is_default(a.config.claude_config_dir)),
+                None,
+            )
+            if duplicate is not None:
+                self.profile_custom.blockSignals(True)
+                self.profile_default.blockSignals(True)
+                self.profile_custom.setChecked(True)
+                self.profile_default.setChecked(False)
+                self.profile_custom.blockSignals(False)
+                self.profile_default.blockSignals(False)
+                self._set_profile_result(
+                    f"✗ 기본 프로필은 이미 '{duplicate.label}'이 사용 중입니다. "
+                    "이 계정은 전용 프로필을 사용하세요.", False)
+                return
             pc.claude_config_dir = ""
         pc.profile_status = ""
         # 사용량 판독도 같은 프로필을 보도록 맞춰준다.
@@ -902,10 +920,10 @@ class AccountsTab(QWidget):
         else:
             self._set_profile_result(f"✗ {err}", False)
 
-    # ---------- claude.ai 계정 연동 ----------
+    # ---------- 사용량 인증 (OAuth 우선, 웹 sessionKey는 호환용) ----------
 
     def _build_link_box(self) -> QGroupBox:
-        box = QGroupBox("🔗 claude.ai 계정 연동")
+        box = QGroupBox("🔗 Claude 사용량 인증")
         box.setStyleSheet(
             f"QGroupBox {{ font-weight: 600; margin-top: 12px; padding-top: 12px; "
             f"border: 1px solid {ACCENT}40; border-radius: 8px; }}"
@@ -922,8 +940,8 @@ class AccountsTab(QWidget):
         v.addWidget(self.link_who)
 
         hint = QLabel(
-            "계정마다 키가 따로 저장됩니다. claude.ai 로그인 → F12 → "
-            "Application → Cookies → sessionKey 복사."
+            "실행 프로필에 로그인하면 OAuth로 자동 조회합니다. 아래 sessionKey는 "
+            "OAuth 조회가 지원되지 않는 계정만 사용하는 호환용 옵션입니다."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet(f"color: {MUTED}; font-size: 10px;")
@@ -934,7 +952,7 @@ class AccountsTab(QWidget):
         self.session_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.session_key.setMinimumWidth(180)
         self.session_key.returnPressed.connect(self._link_verify)
-        key_row.addWidget(QLabel("세션 키"))
+        key_row.addWidget(QLabel("웹 세션 키(선택)"))
         key_row.addWidget(self.session_key, 1)
         v.addLayout(key_row)
 
@@ -953,7 +971,7 @@ class AccountsTab(QWidget):
         self.link_verify_btn.setMinimumWidth(140)
         self.link_verify_btn.setMinimumHeight(34)
         self.link_verify_btn.clicked.connect(self._link_verify)
-        self.link_clear_btn = QPushButton("연결 해제")
+        self.link_clear_btn = QPushButton("웹 키 삭제")
         self.link_clear_btn.setMinimumWidth(110)
         self.link_clear_btn.setMinimumHeight(34)
         self.link_clear_btn.clicked.connect(self._link_clear)
@@ -991,23 +1009,30 @@ class AccountsTab(QWidget):
         """선택된 계정 기준으로 연동 상태 표시를 다시 그린다."""
         pc = account.config
         has_key = bool(load_session_key(account.id))
+        has_oauth = oauth_credentials_available(pc.claude_config_dir)
         self.session_key.setPlaceholderText(
-            "(이 계정의 키가 저장돼 있음 — 바꾸려면 새 키 붙여넣기)"
-            if has_key else "sessionKey 값 붙여넣기"
+            "(호환용 웹 키 저장됨 — 바꾸려면 새 키 붙여넣기)"
+            if has_key else "대부분 필요 없음"
         )
 
-        if pc.account_email:
-            who = f"✓ 연결된 계정: <b>{pc.account_email}</b>"
-            if pc.org_name:
-                who += f" · {pc.org_name}"
+        identity = claude_profile.identity_email(pc.claude_config_dir)
+        if has_oauth:
+            who = "✓ Claude Code OAuth 자동 연결"
+            if identity:
+                who += f": <b>{identity}</b>"
+            if has_key:
+                who += " · 웹 키는 장애 시 보조로만 사용"
+            self.link_who.setStyleSheet(f"color: {ACCENT}; font-size: 11px;")
+        elif pc.account_email:
+            who = f"✓ 호환용 웹 세션 연결: <b>{pc.account_email}</b>"
             self.link_who.setStyleSheet(f"color: {ACCENT}; font-size: 11px;")
         elif has_key:
-            who = ("세션 키 저장됨 — [계정 확인] 을 누르면 어느 계정인지 표시됩니다."
+            who = ("호환용 웹 키 저장됨 — [계정 확인]을 누르면 확인합니다."
                    + (f" (조직 {pc.org_id[:8]}…)" if pc.org_id else ""))
             self.link_who.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
         else:
             local = detect_local_account(pc.log_dir)
-            who = "미연동 — 로컬 로그 추정값으로 표시됩니다."
+            who = "OAuth 미로그인 — 로컬 로그 추정값으로 표시됩니다."
             if local:
                 who += f" (로그 폴더 계정: {local})"
             self.link_who.setStyleSheet(f"color: {MUTED}; font-size: 11px;")
@@ -1021,7 +1046,7 @@ class AccountsTab(QWidget):
             self.org_box.addItem("(계정 확인 후 선택)", "")
         self.org_box.setCurrentIndex(0)
         self.org_box.blockSignals(False)
-        self.org_box.setEnabled(bool(pc.org_id))
+        self.org_box.setEnabled(bool(pc.org_id) and not has_oauth)
 
         self._warn_duplicate(account)
 
@@ -1048,14 +1073,14 @@ class AccountsTab(QWidget):
                     and pc.log_dir and opc.log_dir.lower() == pc.log_dir.lower()):
                 self._set_link_result(
                     f"⚠ '{other.label}' 와 로그 폴더가 같습니다. 로컬 로그에는 계정 구분이 없어 "
-                    f"두 항목이 항상 같은 값을 표시합니다. 계정을 나누려면 각각 세션 키를 등록하세요.",
+                    "두 항목이 항상 같은 값을 표시합니다. 계정마다 전용 실행 프로필을 사용하세요.",
                     False)
                 return
         claude_count = sum(1 for a in self.cfg.providers if a.kind == "claude")
         if not pc.use_api and claude_count > 1:
             self._set_link_result(
                 "ℹ 로컬 로그에는 계정 정보가 없어 이 항목은 계정을 구분하지 못합니다. "
-                "세션 키를 등록하면 해당 계정의 실제 사용량이 표시됩니다.")
+                "실행 프로필에 OAuth 로그인하면 해당 계정의 실제 사용량이 표시됩니다.")
             return
         self.link_result.setText("")
 
@@ -1154,14 +1179,15 @@ class AccountsTab(QWidget):
         pc = account.config
         pc.org_id = ""
         pc.org_name = ""
-        pc.account_email = ""
-        pc.use_api = False
+        if not oauth_credentials_available(pc.claude_config_dir):
+            pc.account_email = ""
+            pc.use_api = False
         self.use_api.blockSignals(True)
-        self.use_api.setChecked(False)
+        self.use_api.setChecked(pc.use_api)
         self.use_api.blockSignals(False)
         self.session_key.clear()
         self._refresh_link_box(account)
-        self._set_link_result("이 계정의 세션 키와 조직 정보를 삭제했습니다.")
+        self._set_link_result("호환용 웹 세션 키를 삭제했습니다. OAuth 연결은 유지됩니다.")
         self._update_provider_fields()
 
     def _refresh_list_keep_row(self, row: int) -> None:
@@ -1188,6 +1214,14 @@ class AccountsTab(QWidget):
             label=f"{label} {len(self.cfg.providers) + 1}",
             config=self._default_config(kind),
         )
+        if kind == "claude":
+            # 추가 Claude 계정은 처음부터 격리한다. 여러 계정이 ~/.claude의
+            # refresh token을 공유/교체하면 며칠 뒤 인증이 연쇄 만료된다.
+            account.config.use_api = True
+            account.config.claude_config_dir = str(
+                claude_profile.unique_profile_path(account.label))
+            account.config.log_dir = claude_profile.projects_dir(
+                account.config.claude_config_dir)
         self.cfg.providers.append(account)
         self._refresh_list()
         self.list.setCurrentRow(len(self.cfg.providers) - 1)
@@ -1285,8 +1319,8 @@ class AccountsTab(QWidget):
         kind = self.kind.currentData() or "claude"
         descriptions = {
             "claude": (
-                "claude.ai 계정을 연결하면 그 계정의 실제 사용량을 표시합니다. "
-                "연결하지 않으면 로그 폴더 기준 추정값이며, 계정 구분이 되지 않습니다."
+                "전용 실행 프로필의 Claude OAuth로 실제 사용량을 표시합니다. "
+                "OAuth를 사용할 수 없으면 호환용 웹 키, 그다음 로컬 로그 순으로 폴백합니다."
             ),
             "codex": "Codex 세션 로그가 보고한 사용률과 초기화 시간을 그대로 표시합니다.",
             "gemini": "로컬 기록의 메시지 수를 설정한 한도와 비교한 추정값입니다.",

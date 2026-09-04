@@ -114,14 +114,9 @@ class TokenStatusApp:
         menu.addAction(self.action_refresh)
 
         # 계정 목록은 설정에서 바뀌므로 열릴 때마다 다시 만든다.
-        self.menu_launch = QMenu("Claude 실행")
+        self.menu_launch = QMenu("Claude 계정으로 실행")
         self.menu_launch.aboutToShow.connect(self._rebuild_launch_menu)
         menu.addMenu(self.menu_launch)
-
-        # 실행 중인 창들의 계정을 통째로 바꾼다 (새 창을 띄우지 않음).
-        self.menu_switch = QMenu("계정 바꾸기")
-        self.menu_switch.aboutToShow.connect(self._rebuild_switch_menu)
-        menu.addMenu(self.menu_switch)
 
         self.action_reset_overlay = QAction("오버레이 위치 초기화")
         self.action_reset_overlay.setToolTip(
@@ -178,19 +173,19 @@ class TokenStatusApp:
                 name += f"   {snap.percent_clamped():.0f}%"
             if not ready and not claude_profile.is_default(pc.claude_config_dir):
                 name += "  — 로그인 필요"
-            # 기본 프로필은 '계정 바꾸기' 로 내용이 바뀔 수 있다. 이름이 거짓말을
-            # 하지 않도록, 지금 그 폴더에 실제로 들어있는 계정을 함께 보여준다.
+            # 기본 프로필도 실제 로그인 계정이 설정과 다르면 실행 전에 알린다.
             tip = pc.profile_status
-            if claude_profile.is_default(pc.claude_config_dir):
-                actual = claude_profile.identity_email("")
-                expected = claude_profile.vault_email(account.id) or pc.account_email
-                if actual and expected and actual != expected:
-                    name += f"  ⚠ 지금은 {actual}"
-                    tip = f"이 항목은 기본 프로필을 가리키는데, 현재 {actual} 로 바뀌어 있습니다."
-                elif actual:
-                    tip = tip or actual
+            actual = claude_profile.identity_email(pc.claude_config_dir)
+            expected = pc.account_email
+            identity_matches = not (actual and expected and actual != expected)
+            if not identity_matches:
+                name += f"  ⚠ 프로필은 {actual}"
+                tip = (f"설정된 계정은 {expected}이지만 이 프로필은 {actual}입니다. "
+                       "설정에서 전용 프로필을 선택해 로그인하세요.")
+            elif actual:
+                tip = tip or actual
             action = QAction(name, self.menu_launch)
-            action.setEnabled(ready)
+            action.setEnabled(ready and identity_matches)
             if tip:
                 action.setToolTip(tip)
             action.triggered.connect(
@@ -253,82 +248,6 @@ class TokenStatusApp:
             self.tray.showMessage(
                 "Token Status", f"실행 실패: {err}",
                 QSystemTrayIcon.MessageIcon.Warning, 5000)
-
-    def _rebuild_switch_menu(self) -> None:
-        """지금 떠 있는 Claude 창 전부의 계정을 바꾼다.
-
-        Claude Code 는 요청할 때마다 자격증명 파일을 다시 읽으므로, 기본
-        프로필(~/.claude)의 자격증명과 계정정보를 함께 갈아끼우면 이미 열려
-        있는 창들도 다음 요청부터 그 계정으로 동작한다.
-        """
-        self.menu_switch.clear()
-        accounts = [a for a in self.cfg.providers if a.kind == "claude"]
-        current_email = claude_profile.identity_email("")
-
-        current_slot = ""
-        rows = []
-        for account in accounts:
-            slot = account.id
-            if not claude_profile.vault_has(slot):
-                # 이 계정의 프로필에 로그인이 있으면 금고에 담아둔다.
-                claude_profile.vault_capture(slot, account.config.claude_config_dir)
-            email = claude_profile.vault_email(slot) or account.config.account_email
-            is_current = bool(email) and email == current_email
-            if is_current:
-                current_slot = slot
-            rows.append((account, slot, email, is_current))
-
-        usable = [r for r in rows if claude_profile.vault_has(r[1])]
-        if not usable:
-            empty = QAction("(저장된 계정 없음 — 각 계정으로 한 번씩 로그인하세요)",
-                            self.menu_switch)
-            empty.setEnabled(False)
-            self.menu_switch.addAction(empty)
-            return
-
-        for account, slot, email, is_current in usable:
-            mark = "✓ " if is_current else "     "
-            name = f"{mark}{account.label or account.kind.title()}"
-            if email:
-                name += f"   {email}"
-            action = QAction(name, self.menu_switch)
-            action.setEnabled(not is_current)
-            action.setToolTip("지금 열려 있는 모든 Claude 창이 이 계정으로 바뀝니다."
-                              if not is_current else "지금 사용 중인 계정입니다.")
-            action.triggered.connect(
-                lambda _c=False, sl=slot, lbl=(account.label or slot), cur=current_slot:
-                self._switch_account(sl, lbl, cur))
-            self.menu_switch.addAction(action)
-
-        self.menu_switch.addSeparator()
-        undo = QAction("방금 바꾼 것 되돌리기", self.menu_switch)
-        undo.triggered.connect(self._undo_switch)
-        self.menu_switch.addAction(undo)
-
-    def _switch_account(self, slot: str, label: str, current_slot: str) -> None:
-        ok, err = claude_profile.switch_account(slot, "", capture_slot=current_slot)
-        if ok:
-            log.info("계정 교체: → %s", label)
-            self.tray.showMessage(
-                "Token Status",
-                f"{label} 계정으로 바꿨습니다.\n"
-                f"열려 있는 Claude 창은 다음 메시지부터 이 계정으로 동작합니다.",
-                QSystemTrayIcon.MessageIcon.Information, 4000)
-            self.monitor.refresh_now()
-        else:
-            log.error("계정 교체 실패 (%s): %s", label, err)
-            self.tray.showMessage("Token Status", f"계정 교체 실패: {err}",
-                                  QSystemTrayIcon.MessageIcon.Warning, 6000)
-
-    def _undo_switch(self) -> None:
-        ok, err = claude_profile.undo_switch("")
-        msg = ("계정을 이전 상태로 되돌렸습니다." if ok else f"되돌리기 실패: {err}")
-        self.tray.showMessage(
-            "Token Status", msg,
-            QSystemTrayIcon.MessageIcon.Information if ok
-            else QSystemTrayIcon.MessageIcon.Warning, 4000)
-        if ok:
-            self.monitor.refresh_now()
 
     def _icon_for(self, percent: float | None) -> QIcon:
         png_bytes = render_tray_icon(percent, size=64)

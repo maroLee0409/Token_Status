@@ -86,6 +86,7 @@ class Monitor:
                     pc.log_dir, pc.window_minutes, pc.token_limit,
                     use_api=pc.use_api, org_id=pc.org_id,
                     account_id=account.id, account_email=pc.account_email,
+                    claude_config_dir=pc.claude_config_dir,
                 )
             elif account.kind == "codex":
                 snap = read_codex(pc.log_dir, pc.window_minutes, pc.token_limit)
