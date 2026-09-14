@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
 import logging
 
-from . import claude_profile
+from . import autostart, claude_profile
 from .config import Config
 from .icon_renderer import render_tray_icon
 from .logger import setup as setup_logging
@@ -74,6 +74,10 @@ class TokenStatusApp:
         self._already_running = False
 
         self.cfg = Config.load()
+        try:
+            autostart.apply(self.cfg.autostart)
+        except Exception:  # noqa: BLE001
+            log.exception("autostart sync failed")
         self.monitor = Monitor(lambda: self.cfg)
         self.bridge = _Bridge()
         self.bridge.snapshots_ready.connect(self._on_snapshots)

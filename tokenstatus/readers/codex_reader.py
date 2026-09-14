@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from .base import ProviderSnapshot
+from .codex_api import fetch_codex_usage
 
 
 _RECENT_FILES_TO_SCAN = 25
@@ -71,6 +72,35 @@ def _fmt_window(minutes: int | float | None) -> str:
 
 
 def read_codex(log_dir: str, window_minutes: int, token_limit: int) -> ProviderSnapshot:
+    """Live usage from the Codex backend, falling back to session logs."""
+    usage, err = fetch_codex_usage(log_dir)
+    if usage is None:
+        snap = _read_codex_logs(log_dir)
+        if snap.available and err:
+            snap.note = f"{snap.note} | 로그 기준 ({err})" if snap.note else f"로그 기준 ({err})"
+        return snap
+
+    snap = ProviderSnapshot(name="Codex", unit="%", available=True, limit=100)
+    snap.percent = usage.primary_pct
+    snap.used = int(usage.primary_pct)
+    snap.resets_at = usage.primary_resets_at
+    snap.window_label = _fmt_window(usage.primary_window_minutes)
+    snap.secondary_percent = usage.secondary_pct
+    if usage.secondary_pct is not None:
+        snap.secondary_label = _fmt_window(usage.secondary_window_minutes)
+    notes = [f"plan: {usage.plan_type}", "Codex live usage"]
+    if usage.limit_reached:
+        notes.append("limit reached")
+    snap.note = " | ".join(notes)
+    try:
+        latest = max(Path(log_dir).rglob("rollout-*.jsonl"), key=lambda p: p.stat().st_mtime)
+        snap.last_activity = latest.stat().st_mtime
+    except (ValueError, OSError):
+        pass
+    return snap
+
+
+def _read_codex_logs(log_dir: str) -> ProviderSnapshot:
     snap = ProviderSnapshot(
         name="Codex",
         unit="%",

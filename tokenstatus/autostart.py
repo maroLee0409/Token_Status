@@ -36,13 +36,19 @@ if sys.platform.startswith("win"):
     def _command_string() -> str:
         return " ".join(f'"{p}"' if " " in p else p for p in _launch_parts())
 
-    def is_enabled() -> bool:
+    def _registered_command() -> str | None:
         try:
             with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_READ) as key:
-                winreg.QueryValueEx(key, APP_NAME)
-            return True
+                return str(winreg.QueryValueEx(key, APP_NAME)[0])
         except OSError:
-            return False
+            return None
+
+    def is_enabled() -> bool:
+        return _registered_command() is not None
+
+    def is_current() -> bool:
+        """False when the registered command points at an old install location."""
+        return _registered_command() == _command_string()
 
     def enable() -> None:
         with winreg.OpenKey(
@@ -88,6 +94,12 @@ elif sys.platform == "darwin":
     def is_enabled() -> bool:
         return _PLIST.exists()
 
+    def is_current() -> bool:
+        try:
+            return _PLIST.read_text(encoding="utf-8") == _plist_xml()
+        except OSError:
+            return False
+
     def enable() -> None:
         _PLIST.parent.mkdir(parents=True, exist_ok=True)
         _PLIST.write_text(_plist_xml(), encoding="utf-8")
@@ -104,6 +116,9 @@ else:
     def is_enabled() -> bool:
         return False
 
+    def is_current() -> bool:
+        return True
+
     def enable() -> None:
         pass
 
@@ -112,7 +127,8 @@ else:
 
 
 def apply(desired: bool) -> None:
-    if desired and not is_enabled():
+    # Re-register when the project folder moved, otherwise login launches a dead path.
+    if desired and not (is_enabled() and is_current()):
         enable()
     elif not desired and is_enabled():
         disable()
